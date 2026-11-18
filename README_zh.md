@@ -93,6 +93,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yuwenlong/agy-hud/main/unins
 irm https://raw.githubusercontent.com/yuwenlong/agy-hud/main/uninstall.ps1 | iex
 ```
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=yuwenlong%2Fagy-hud&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yuwenlong/agy-hud&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yuwenlong/agy-hud&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yuwenlong/agy-hud&type=date&legend=top-left" />
+ </picture>
+</a>
+
 ## License
 
 MIT
