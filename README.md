@@ -112,6 +112,16 @@ Logic under `src/**/*.ts` runs inside Node's `--permission` sandbox combined wit
 
 Run `npm test` and `npm run verify` to validate types, unit tests, architecture rules, escape probes, launcher behavior, and corpus fixtures.
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=yuwenlong%2Fagy-hud&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yuwenlong/agy-hud&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yuwenlong/agy-hud&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yuwenlong/agy-hud&type=date&legend=top-left" />
+ </picture>
+</a>
+
 ## License
 
 MIT
