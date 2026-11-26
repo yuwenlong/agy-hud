@@ -12,12 +12,12 @@ export function getCachePath(env = process.env) {
   return resolveAntigravityPath('agy-hud-quota-cache.json', env);
 }
 
-export function isCachePayloadFresh(raw) {
+export function isCachePayloadFresh(raw, now = Date.now()) {
   return Boolean(
     raw &&
     raw.version === CACHE_VERSION &&
     raw.expiresAt &&
-    Date.now() < raw.expiresAt &&
+    now < raw.expiresAt &&
     Array.isArray(raw.data)
   );
 }
@@ -65,10 +65,10 @@ export function didAccessTokenRotate(raw, tokenOrAccessToken) {
   return Boolean(raw && raw.tokenHash && tokenHash && raw.tokenHash !== tokenHash);
 }
 
-export function readCache(tokenOrAccessToken, cachePath = getCachePath()) {
+export function readCache(tokenOrAccessToken, cachePath = getCachePath(), now = Date.now()) {
   try {
     const raw = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-    if (!isCachePayloadFresh(raw)) return null;
+    if (!isCachePayloadFresh(raw, now)) return null;
     if (!doesCachePayloadMatchToken(raw, tokenOrAccessToken)) return null;
     if (raw.providerQuota && Array.isArray(raw.data)) raw.data.providerQuota = raw.providerQuota;
     return raw.data;
@@ -145,8 +145,7 @@ function sanitizeModelTopLevelReset(model, now) {
   };
 }
 
-export function writeCache(data, tokenOrAccessToken, tier = null, accountEmail = null, providerQuota = null, cachePath = getCachePath()) {
-  const now = Date.now();
+export function writeCache(data, tokenOrAccessToken, tier = null, accountEmail = null, providerQuota = null, cachePath = getCachePath(), now = Date.now()) {
   const previousRaw = readCacheRaw(cachePath);
   const tokenEmail = typeof tokenOrAccessToken === 'object' ? tokenOrAccessToken?.email : null;
   const effectiveEmail = accountEmail || tokenEmail || null;

@@ -49,26 +49,39 @@ if (-not $env:AGY_HUD_REPO_RAW -or $env:AGY_HUD_REPO_URL) {
 
 $env:AGY_HUD_REPO_RAW = $RepoRaw
 $env:NODE_USE_ENV_PROXY = '1'
-if ($PluginDir) {
-    $env:AGY_HUD_SETUP_SOURCE_DIR = $PluginDir
-    node (Join-Path $PluginDir 'scripts\bootstrap.js')
-    if ($LASTEXITCODE -ne 0) { throw "bootstrap exited with code $LASTEXITCODE" }
-} else {
-    $BootstrapUrl = "$RepoRaw/scripts/bootstrap.js"
-    $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "agy-hud-bootstrap-$PID"
-    New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
-    $TempBootstrap = Join-Path $TempDir 'bootstrap.mjs'
-    try {
-        Invoke-WebRequest -Uri $BootstrapUrl -OutFile $TempBootstrap -UseBasicParsing
-        node $TempBootstrap
+$prevPsProfile = $env:AGY_HUD_PS_PROFILE
+$hadPsProfile = Test-Path Env:AGY_HUD_PS_PROFILE
+try {
+    if (-not $env:AGY_HUD_PS_PROFILE -and $PROFILE -and $PROFILE.CurrentUserAllHosts) {
+        $env:AGY_HUD_PS_PROFILE = $PROFILE.CurrentUserAllHosts
+    }
+    if ($PluginDir) {
+        $env:AGY_HUD_SETUP_SOURCE_DIR = $PluginDir
+        node (Join-Path $PluginDir 'scripts\bootstrap.js')
         if ($LASTEXITCODE -ne 0) { throw "bootstrap exited with code $LASTEXITCODE" }
-    } finally {
-        Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        $BootstrapUrl = "$RepoRaw/scripts/bootstrap.js"
+        $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "agy-hud-bootstrap-$PID"
+        New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+        $TempBootstrap = Join-Path $TempDir 'bootstrap.mjs'
+        try {
+            Invoke-WebRequest -Uri $BootstrapUrl -OutFile $TempBootstrap -UseBasicParsing
+            node $TempBootstrap
+            if ($LASTEXITCODE -ne 0) { throw "bootstrap exited with code $LASTEXITCODE" }
+        } finally {
+            Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+} finally {
+    if ($hadPsProfile) {
+        $env:AGY_HUD_PS_PROFILE = $prevPsProfile
+    } else {
+        Remove-Item Env:AGY_HUD_PS_PROFILE -ErrorAction SilentlyContinue
     }
 }
 
 Write-Host ""
 Write-Host "==> agy-hud installed."
-Write-Host "    Open a new agy session in your terminal to see the HUD."
+Write-Host "    Open a new PowerShell window and run 'agy' to see the live HUD."
 Write-Host "    Run /hud doctor to inspect diagnostics."
 Write-Host "    Repair anytime by re-running this script."

@@ -52,11 +52,28 @@ function formatWindow(f: Frame, layout: Layout, w: UsageWindow, align: LabelAlig
   return `${styledLabel} ${percent}${resetText ? ` (${resetText})` : ''}`;
 }
 
+function pickActiveLimitReset(usage: NonNullable<Frame['usageData']>, now: number): Date | null {
+  const isUnexpired = (resetAt: Date | null): boolean => resetAt == null || resetAt.getTime() > now;
+  const fiveActive = usage.fiveHour === 100 && isUnexpired(usage.fiveHourResetAt);
+  const sevenActive = usage.sevenDay === 100 && isUnexpired(usage.sevenDayResetAt);
+  if (fiveActive && sevenActive) {
+    if (usage.fiveHourResetAt && usage.sevenDayResetAt) {
+      return usage.fiveHourResetAt.getTime() >= usage.sevenDayResetAt.getTime()
+        ? usage.fiveHourResetAt
+        : usage.sevenDayResetAt;
+    }
+    return usage.fiveHourResetAt ?? usage.sevenDayResetAt ?? null;
+  }
+  if (fiveActive) return usage.fiveHourResetAt ?? null;
+  if (sevenActive) return usage.sevenDayResetAt ?? null;
+  return null;
+}
+
 function limitNotice(f: Frame): string {
   const display = f.config?.display;
   const usage = f.usageData!;
   const format = limitTimeFormat(display?.timeFormat ?? 'relative');
-  const resetAt = usage.fiveHour === 100 ? usage.fiveHourResetAt : usage.sevenDayResetAt;
+  const resetAt = pickActiveLimitReset(usage, f.now);
   const reset = formatResetTime(resetAt, format, wallClock(display), f.now);
   const warn = f.unicode ? '⚠' : '!';
   if (display?.usageCompact) {
@@ -94,7 +111,7 @@ export function usageParts(f: Frame, layout: Layout, align: LabelAlign = {}): st
     durationLabel: '7d',
   }, align));
 
-  if (isLimitReached(usage)) {
+  if (isLimitReached(usage, f.now)) {
     const notice = limitNotice(f);
     return withBalance([compact || display?.usageCompact ? notice : withLabel(notice), ...scoped]);
   }

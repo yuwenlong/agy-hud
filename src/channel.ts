@@ -53,13 +53,13 @@ export interface Paths {
     dotClaudeMd: string | null;
     dotLocalMd: string;
     rules: string | null;
-    geminiRules: string;
-    agentsRules: string;
-    cursorRules: string;
-    githubRules: string;
+    geminiRules: string | null;
+    agentsRules: string | null;
+    cursorRules: string | null;
+    githubRules: string | null;
     agents?: string | null;
-    geminiAgents?: string;
-    agentsAgents?: string;
+    geminiAgents?: string | null;
+    agentsAgents?: string | null;
     settings: string | null;
     localSettings: string;
   } | null;
@@ -111,6 +111,8 @@ export interface InitMessage {
   now: number;
   paths: Paths;
   command?: CommandRequest;
+  persistent?: boolean;
+  cols?: number | null;
 }
 
 export interface ReplyMessage {
@@ -124,13 +126,45 @@ export interface Channel {
   init: Promise<InitMessage>;
   ask: Ask;
   reply: (msg: ReplyMessage) => void;
+  nextRequest: () => Promise<InitMessage | null>;
 }
 
 function createFdChannel(): Channel {
   let nextId = 1;
   let closed = false;
+  let eof = false;
+  let initSettled = false;
+  let isPersistent = false;
+  let reading = false;
   let remainder: Buffer = Buffer.alloc(0);
   const pending = new Map<number, (answers: Record<string, unknown>) => void>();
+  const requestQueue: InitMessage[] = [];
+  const requestWaiters: Array<(msg: InitMessage | null) => void> = [];
+
+  let resolveInit!: (msg: InitMessage) => void;
+  let rejectInit!: (err: Error) => void;
+  const init = new Promise<InitMessage>((resolve, reject) => {
+    resolveInit = resolve;
+    rejectInit = reject;
+  });
+
+  const enqueueRequest = (msg: InitMessage): void => {
+    const waiter = requestWaiters.shift();
+    if (waiter) waiter(msg);
+    else requestQueue.push(msg);
+  };
+
+  const flushClosedState = (): void => {
+    if (!initSettled) {
+      initSettled = true;
+      rejectInit(new Error('channel closed before init message'));
+    }
+    for (const done of pending.values()) done({});
+    pending.clear();
+    while (requestWaiters.length > 0) {
+      requestWaiters.shift()!(null);
+    }
+  };
 
   const readOneChunk = (): Promise<Buffer | null> =>
     new Promise((resolve) => {
@@ -163,7 +197,6 @@ function createFdChannel(): Channel {
     return null;
   };
 
-  let pumpActive = false;
   const dispatchLine = (raw: string): void => {
     if (!raw.trim()) return;
     let msg: Record<string, unknown>;
@@ -176,57 +209,95 @@ function createFdChannel(): Channel {
       const done = pending.get(msg.id)!;
       pending.delete(msg.id);
       done((msg.answers && typeof msg.answers === 'object' ? msg.answers : {}) as Record<string, unknown>);
+      return;
+    }
+    if ('paths' in msg) {
+      const req = msg as unknown as InitMessage;
+      if (!initSettled) {
+        initSettled = true;
+        isPersistent = req.persistent === true;
+        resolveInit(req);
+      } else {
+        enqueueRequest(req);
+      }
     }
   };
 
-  const pumpAnswers = async (): Promise<void> => {
-    if (pumpActive) return;
-    pumpActive = true;
+  const shouldRead = (): boolean =>
+    !closed && !eof && (!initSettled || isPersistent || pending.size > 0 || requestWaiters.length > 0);
+
+  const pump = async (): Promise<void> => {
+    if (reading) return;
+    reading = true;
     try {
-      while (!closed && pending.size > 0) {
+      while (shouldRead()) {
         const raw = await nextLine();
         if (raw === null) {
-          for (const done of pending.values()) done({});
-          pending.clear();
+          eof = true;
+          flushClosedState();
           return;
         }
         dispatchLine(raw);
       }
     } finally {
-      pumpActive = false;
+      reading = false;
+      if (shouldRead()) void pump();
     }
   };
 
-  const init = (async (): Promise<InitMessage> => {
-    while (!closed) {
-      const raw = await nextLine();
-      if (raw === null) throw new Error('channel closed before init message');
-      if (!raw.trim()) continue;
-      const msg = JSON.parse(raw) as Record<string, unknown>;
-      if ('paths' in msg) return msg as unknown as InitMessage;
+  void pump();
+
+  const safeWriteLine = (payload: unknown): boolean => {
+    try {
+      fs.writeSync(1, `${JSON.stringify(payload)}\n`);
+      return true;
+    } catch {
+      return false;
     }
-    throw new Error('channel closed before init message');
-  })();
+  };
 
   const ask: Ask = (names) => {
     const unique = [...new Set(names)];
-    if (unique.length === 0 || closed) return Promise.resolve({} as Record<Probe, unknown>);
+    if (unique.length === 0 || closed || eof) return Promise.resolve({} as Record<Probe, unknown>);
     const id = nextId++;
     return new Promise<Record<Probe, unknown>>((resolve) => {
       pending.set(id, (answers) => resolve(answers as Record<Probe, unknown>));
-      fs.writeSync(1, `${JSON.stringify({ id, ask: unique })}\n`);
-      void pumpAnswers();
+      if (!safeWriteLine({ id, ask: unique })) {
+        pending.delete(id);
+        closed = true;
+        flushClosedState();
+        resolve({} as Record<Probe, unknown>);
+        return;
+      }
+      void pump();
+    });
+  };
+
+  const nextRequest = (): Promise<InitMessage | null> => {
+    if (requestQueue.length > 0) return Promise.resolve(requestQueue.shift()!);
+    if (closed || eof) return Promise.resolve(null);
+    return new Promise<InitMessage | null>((resolve) => {
+      requestWaiters.push(resolve);
+      void pump();
     });
   };
 
   const reply = (msg: ReplyMessage): void => {
-    closed = true;
     for (const done of pending.values()) done({});
     pending.clear();
-    fs.writeSync(1, `${JSON.stringify(msg)}\n`);
+    if (!isPersistent) {
+      closed = true;
+      while (requestWaiters.length > 0) {
+        requestWaiters.shift()!(null);
+      }
+    }
+    if (!safeWriteLine(msg)) {
+      closed = true;
+      flushClosedState();
+    }
   };
 
-  return { init, ask, reply };
+  return { init, ask, reply, nextRequest };
 }
 
 export function createChannel(
@@ -237,7 +308,12 @@ export function createChannel(
   if (!input || !output) return createFdChannel();
 
   let nextId = 1;
+  let closed = false;
+  let eof = false;
+  let isPersistent = false;
   const pending = new Map<number, (answers: Record<string, unknown>) => void>();
+  const requestQueue: InitMessage[] = [];
+  const requestWaiters: Array<(msg: InitMessage | null) => void> = [];
   let resolveInit!: (msg: InitMessage) => void;
   let rejectInit!: (err: Error) => void;
   let initSettled = false;
@@ -246,6 +322,12 @@ export function createChannel(
     resolveInit = resolve;
     rejectInit = reject;
   });
+
+  const enqueueRequest = (msg: InitMessage): void => {
+    const waiter = requestWaiters.shift();
+    if (waiter) waiter(msg);
+    else requestQueue.push(msg);
+  };
 
   const rl = readline.createInterface({ input, crlfDelay: Infinity });
   rl.on('line', (raw) => {
@@ -256,30 +338,40 @@ export function createChannel(
     } catch {
       return;
     }
-    if (!initSettled && 'paths' in msg) {
-      initSettled = true;
-      resolveInit(msg as unknown as InitMessage);
-      return;
-    }
     if (typeof msg.id === 'number' && pending.has(msg.id)) {
       const done = pending.get(msg.id)!;
       pending.delete(msg.id);
       done((msg.answers && typeof msg.answers === 'object' ? msg.answers : {}) as Record<string, unknown>);
+      return;
+    }
+    if ('paths' in msg) {
+      const req = msg as unknown as InitMessage;
+      if (!initSettled) {
+        initSettled = true;
+        isPersistent = req.persistent === true;
+        resolveInit(req);
+      } else {
+        enqueueRequest(req);
+      }
     }
   });
 
   rl.once('close', () => {
+    eof = true;
     if (!initSettled) {
       initSettled = true;
       rejectInit(new Error('channel closed before init message'));
     }
     for (const done of pending.values()) done({});
     pending.clear();
+    while (requestWaiters.length > 0) {
+      requestWaiters.shift()!(null);
+    }
   });
 
   const ask: Ask = (names) => {
     const unique = [...new Set(names)];
-    if (unique.length === 0) return Promise.resolve({} as Record<Probe, unknown>);
+    if (unique.length === 0 || closed || eof) return Promise.resolve({} as Record<Probe, unknown>);
     const id = nextId++;
     return new Promise<Record<Probe, unknown>>((resolve) => {
       pending.set(id, (answers) => resolve(answers as Record<Probe, unknown>));
@@ -287,10 +379,26 @@ export function createChannel(
     });
   };
 
-  const reply = (msg: ReplyMessage): void => {
-    output.write(`${JSON.stringify(msg)}\n`);
-    rl.close();
+  const nextRequest = (): Promise<InitMessage | null> => {
+    if (requestQueue.length > 0) return Promise.resolve(requestQueue.shift()!);
+    if (closed || eof) return Promise.resolve(null);
+    return new Promise<InitMessage | null>((resolve) => {
+      requestWaiters.push(resolve);
+    });
   };
 
-  return { init, ask, reply };
+  const reply = (msg: ReplyMessage): void => {
+    for (const done of pending.values()) done({});
+    pending.clear();
+    output.write(`${JSON.stringify(msg)}\n`);
+    if (!isPersistent) {
+      closed = true;
+      while (requestWaiters.length > 0) {
+        requestWaiters.shift()!(null);
+      }
+      rl.close();
+    }
+  };
+
+  return { init, ask, reply, nextRequest };
 }

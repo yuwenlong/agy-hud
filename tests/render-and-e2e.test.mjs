@@ -8,8 +8,12 @@ import { fileURLToPath } from 'node:url';
 
 import { mergeConfig } from '../src/config.ts';
 import { renderPlain } from '../src/render/index.ts';
-import { stripAnsi, visibleWidth, wrapToWidth } from '../src/render/ansi.ts';
+import { stripAnsi, textWidth, truncateTextToWidth, visibleWidth, wrapToWidth } from '../src/render/ansi.ts';
+import { formatAgo, formatResetTime, wallClock } from '../src/render/time.ts';
+import { isLimitReached } from '../src/types.ts';
 import { extraCmdLabel } from '../src/extra-cmd.ts';
+import { computeNextRefreshDelay, createRenderWorker, terminalFilter } from '../hud.mjs';
+import * as collector from '../collector.mjs';
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 const NOW = Date.parse('2026-11-18T10:00:00Z');
@@ -218,7 +222,10 @@ describe('render / expanded, compact, i18n, colors, quota styles, wrapping', () 
     assert.match(table, /Image Quota:/);
 
     const models = stripAnsi(renderPlain(baseCtx({ config: mergeConfig({ display: { quotaStyle: 'models' } }) }), 140, NOW));
-    assert.match(models, /Gemini 3 Pro\(High\)/);
+    assert.match(models, /Gemini 3 Pro\(Hi…/);
+
+    const wideModels = stripAnsi(renderPlain(baseCtx({ config: mergeConfig({ display: { quotaStyle: 'models', columnWidth: 42 } }) }), 140, NOW));
+    assert.match(wideModels, /Gemini 3 Pro\(High\)/);
 
     const compactBars = stripAnsi(renderPlain(baseCtx({ config: mergeConfig({ display: { quotaStyle: 'compact' } }) }), 140, NOW));
     assert.match(compactBars, /Google:/);
@@ -243,7 +250,7 @@ describe('render / expanded, compact, i18n, colors, quota styles, wrapping', () 
         ],
       },
     }), 140, NOW));
-    assert.match(expiredModelsOut, /Gemini 3 Pro\(High\)\s+██████\s+100\.00%/);
+    assert.match(expiredModelsOut, /Gemini 3 Pro\(Hi…\s+██████\s+100\.00%/);
 
     // imageQuotaLine renders dynamic countdown while active and clears Exhausted once resetTime <= f.now
     const activeExhaustedOut = stripAnsi(renderPlain(baseCtx({
@@ -253,7 +260,7 @@ describe('render / expanded, compact, i18n, colors, quota styles, wrapping', () 
         imageExhausted: { exhausted: true, resetTime: new Date(NOW + 4 * 60_000).toISOString() },
       },
     }), 140, NOW));
-    assert.match(activeExhaustedOut, /Image Quota: Image Quota Exhausted \(4m\)/);
+    assert.match(activeExhaustedOut, /Image Quota: Image Quota Exhausted \(4m 0s\)/);
 
     const expiredExhaustedOut = stripAnsi(renderPlain(baseCtx({
       config: mergeConfig({ language: 'en', display: { showImageQuota: true } }),
@@ -590,7 +597,16 @@ describe('render / expanded, compact, i18n, colors, quota styles, wrapping', () 
         conversation_id: mainConv,
         context_window: { context_window_size: 200_000, used_percentage: 20 },
       });
-      const subEnv = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome, AGY_HUD_DATA_DIR: agyCli, LANG: 'zh_CN.UTF-8' };
+      const subEnv = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome, AGY_HUD_DATA_DIR: agyCli, LANG: 'zh_CN.UTF-8', AGY_HUD_FORCE_UNICODE: '1' };
+      delete subEnv.APPDATA;
+      delete subEnv.LOCALAPPDATA;
+      delete subEnv.XDG_DATA_HOME;
+      delete subEnv.XDG_CONFIG_HOME;
+      delete subEnv.AGY_CONFIG_DIR;
+      delete subEnv.CLAUDE_CONFIG_DIR;
+      delete subEnv.LC_ALL;
+      delete subEnv.LC_CTYPE;
+      delete subEnv.AGY_HUD_FORCE_ASCII;
       const subRes = spawnSync(process.execPath, ['hud.mjs'], {
         cwd: projectRoot,
         input: `${subPayload}\n`,
@@ -623,7 +639,608 @@ describe('render / expanded, compact, i18n, colors, quota styles, wrapping', () 
       assert.match(subDonePlain, /1 Agents/);
       assert.doesNotMatch(subDonePlain, /[✓◐]\s*worker|worker\s+\[Gemini 4 Hydrogen|\(Scan\)/);
     } finally {
-      fs.rmSync(fakeHome, { recursive: true, force: true });
+      fs.rmSync(fakeHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  test('formatResetTime uses 3-tier dynamic precision while keeping formatAgo unchanged', () => {
+    const wc = wallClock(undefined);
+    const fmt = (ms) => formatResetTime(new Date(NOW + ms), 'relative', wc, NOW);
+
+    assert.equal(formatResetTime(null, 'relative', wc, NOW), '');
+    assert.equal(fmt(0), '');
+    assert.equal(fmt(-1000), '');
+    assert.equal(formatResetTime(new Date(Number.NaN), 'relative', wc, NOW), '');
+
+    // < 60s
+    assert.equal(fmt(1), '1s');
+    assert.equal(fmt(42_000), '42s');
+    assert.equal(fmt(59_000), '59s');
+
+    // 60s .. < 1h (always includes seconds, monotonic at 1h boundary)
+    assert.equal(fmt(59_001), '1m 0s');
+    assert.equal(fmt(4 * 60_000), '4m 0s');
+    assert.equal(fmt(3599_000), '59m 59s');
+    assert.equal(fmt(3599_001), '1h');
+    assert.equal(fmt(3600_000), '1h');
+    assert.equal(fmt(3600_001), '1h 1m');
+
+    // 1h .. < 24h
+    assert.equal(fmt(90 * 60_000), '1h 30m');
+    assert.equal(fmt(23 * 3600_000 + 59 * 60_000), '23h 59m');
+
+    // >= 24h (all 4 remHours/mins branches)
+    assert.equal(fmt(24 * 3600_000), '1d');
+    assert.equal(fmt(7 * 86400_000), '7d');
+    assert.equal(fmt(24 * 3600_000 + 5 * 60_000), '1d 0h 5m');
+    assert.equal(fmt(25 * 3600_000), '1d 1h');
+    assert.equal(fmt(162 * 3600_000 + 3 * 60_000), '6d 18h 3m');
+
+    // Past durations via formatAgo remain unchanged
+    assert.equal(formatAgo(4 * 60_000), '4m ago');
+    assert.equal(formatAgo(45_000), '45s ago');
+    assert.equal(formatAgo(25 * 3600_000), '1d 1h ago');
+  });
+
+  test('provider table and models table align vertical bars cleanly within 80-column terminal', () => {
+    const tableOut = stripAnsi(renderPlain(baseCtx({
+      config: mergeConfig({
+        language: 'en',
+        display: { quotaStyle: 'table', showTier: false, showSessionSteps: false, showUpdateNotice: false },
+      }),
+      agyQuota: {
+        models: [],
+        providerQuota: {
+          google: {
+            fiveHour: { remainingFraction: 0.42, resetTime: new Date(NOW + 59 * 60_000 + 42_000).toISOString() },
+            weekly: { remainingFraction: 0.55, resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString() },
+          },
+          claude: {
+            fiveHour: { remainingFraction: 0.1, resetTime: new Date(NOW + 42_000).toISOString() },
+            weekly: { remainingFraction: 0.88, resetTime: new Date(NOW + 7 * 86400_000).toISOString() },
+          },
+          argon: {
+            fiveHour: { remainingFraction: 1, resetTime: new Date(NOW + 4 * 3600_000).toISOString() },
+            weekly: { remainingFraction: 1, resetTime: new Date(NOW + 24 * 3600_000 + 5 * 60_000).toISOString() },
+          },
+        },
+        unavailableReason: null,
+        tierName: null,
+        accountEmail: null,
+        updateInfo: null,
+      },
+    }), 80, NOW));
+
+    const lines = tableOut.split('\n');
+    const ruleLine = lines.find((line) => /^\s+─+$/.test(line));
+    assert.ok(ruleLine, `expected horizontal rule line in:\n${tableOut}`);
+    assert.equal(visibleWidth(ruleLine), 79, '2-space indent + 77-char rule should total 79 <= 80');
+
+    const tableRows = lines.filter((line) => line.includes('│') && /(Google|Claude|Argon)/.test(line));
+    assert.equal(tableRows.length, 3);
+    const barColumns = new Set(tableRows.map((row) => visibleWidth(row.slice(0, row.indexOf('│')))));
+    assert.equal(barColumns.size, 1, 'middle │ separator must align vertically across all provider rows');
+    for (const row of tableRows) {
+      assert.ok(visibleWidth(row) <= 80, `row exceeds 80 columns (${visibleWidth(row)}): ${row}`);
+    }
+    assert.match(tableOut, /~59m42s/);
+    assert.match(tableOut, /~6d18h30m/);
+    assert.match(tableOut, /~42s/);
+    assert.match(tableOut, /~1d0h5m/);
+
+    // Models table respects nameWidth = Math.max(8, columnWidth - 24) even at minimum columnWidth (24)
+    const minModelsOut = stripAnsi(renderPlain(baseCtx({
+      config: mergeConfig({ display: { quotaStyle: 'models', columnWidth: 24 } }),
+      agyQuota: {
+        ...baseCtx().agyQuota,
+        models: [
+          {
+            id: 'gemini-3-pro',
+            displayName: 'Gemini 3 Pro (High)',
+            remainingFraction: 0.5,
+            resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString(),
+            modelProvider: 'MODEL_PROVIDER_GOOGLE',
+          },
+          {
+            id: 'claude-sonnet-4-6',
+            displayName: 'Claude Sonnet 4.6 (High)',
+            remainingFraction: 0.75,
+            resetTime: new Date(NOW + 45_000).toISOString(),
+            modelProvider: 'MODEL_PROVIDER_ANTHROPIC',
+          },
+        ],
+      },
+    }), 140, NOW));
+    assert.match(minModelsOut, /Gemini …\s+███░░░\s+50\.00%\s+~6d18h30m/);
+    assert.match(minModelsOut, /Sonnet …\s+█████░\s+75\.00%\s+~45s/);
+  });
+
+  test('isLimitReached, limitNotice, and imageQuotaLine recover cleanly when reset windows expire', () => {
+    const past = new Date(NOW - 5_000);
+    const futureSoon = new Date(NOW + 60 * 60_000);
+    const futureLater = new Date(NOW + 3 * 86400_000);
+
+    // isLimitReached ignores expired 100% windows
+    assert.equal(isLimitReached({
+      fiveHour: 100, sevenDay: 20, fiveHourResetAt: past, sevenDayResetAt: futureLater,
+    }, NOW), false);
+    assert.equal(isLimitReached({
+      fiveHour: 20, sevenDay: 100, fiveHourResetAt: futureSoon, sevenDayResetAt: past,
+    }, NOW), false);
+    assert.equal(isLimitReached({
+      fiveHour: 100, sevenDay: 20, fiveHourResetAt: null, sevenDayResetAt: null,
+    }, NOW), true);
+    assert.equal(isLimitReached({
+      fiveHour: 100, sevenDay: 100, fiveHourResetAt: past, sevenDayResetAt: futureLater,
+    }, NOW), true);
+
+    const minimalCfg = mergeConfig({ language: 'en', display: { quotaStyle: 'minimal', usageCompact: false } });
+
+    // Expired 5h=100% clears Limit reached in minimal HUD
+    const clearedLimit = stripAnsi(renderPlain(baseCtx({
+      config: minimalCfg,
+      usageData: { fiveHour: 100, sevenDay: 20, fiveHourResetAt: past, sevenDayResetAt: futureLater },
+    }), 140, NOW));
+    assert.doesNotMatch(clearedLimit, /Limit reached/);
+
+    // Expired 5h=100% + active 7d=100% picks active 7d resetAt
+    const activeSevenOnly = stripAnsi(renderPlain(baseCtx({
+      config: minimalCfg,
+      usageData: { fiveHour: 100, sevenDay: 100, fiveHourResetAt: past, sevenDayResetAt: futureLater },
+    }), 140, NOW));
+    assert.match(activeSevenOnly, /Limit reached \(resets in 3d\)/);
+
+    // Both active 100% -> picks later resetAt
+    const bothActive = stripAnsi(renderPlain(baseCtx({
+      config: minimalCfg,
+      usageData: { fiveHour: 100, sevenDay: 100, fiveHourResetAt: futureSoon, sevenDayResetAt: futureLater },
+    }), 140, NOW));
+    assert.match(bothActive, /Limit reached \(resets in 3d\)/);
+
+    // Both active 100%, one null resetAt -> picks non-null resetAt
+    const sevenNull = stripAnsi(renderPlain(baseCtx({
+      config: minimalCfg,
+      usageData: { fiveHour: 100, sevenDay: 100, fiveHourResetAt: futureSoon, sevenDayResetAt: null },
+    }), 140, NOW));
+    assert.match(sevenNull, /Limit reached \(resets in 1h\)/);
+
+    const fiveNull = stripAnsi(renderPlain(baseCtx({
+      config: minimalCfg,
+      usageData: { fiveHour: 100, sevenDay: 100, fiveHourResetAt: null, sevenDayResetAt: futureLater },
+    }), 140, NOW));
+    assert.match(fiveNull, /Limit reached \(resets in 3d\)/);
+
+    // imageQuotaLine resets expired imgModel (0% + past resetTime) to 100% and hides countdown
+    const recoveredImg = stripAnsi(renderPlain(baseCtx({
+      config: mergeConfig({ language: 'en', display: { showImageQuota: true } }),
+      agyQuota: {
+        ...baseCtx().agyQuota,
+        models: [
+          {
+            id: 'gemini-3-image',
+            displayName: 'Gemini 3 Image',
+            remainingFraction: 0,
+            resetTime: past.toISOString(),
+            modelProvider: 'MODEL_PROVIDER_GOOGLE',
+          },
+        ],
+      },
+    }), 140, NOW));
+    assert.match(recoveredImg, /Image Quota: Gemini 3 Image .* 100%$/m);
+    assert.doesNotMatch(recoveredImg, /Image Quota: Gemini 3 Image .* \(/);
+
+    // imageQuotaLine matches uppercase IMAGE models via isAgyImageModel and guards NaN remainingFraction
+    const upperNanImg = stripAnsi(renderPlain(baseCtx({
+      config: mergeConfig({ language: 'en', display: { showImageQuota: true } }),
+      agyQuota: {
+        ...baseCtx().agyQuota,
+        models: [
+          {
+            id: 'gemini-3-IMAGE',
+            displayName: 'IMAGEN 3',
+            remainingFraction: Number.NaN,
+            resetTime: futureSoon.toISOString(),
+            modelProvider: 'MODEL_PROVIDER_GOOGLE',
+          },
+        ],
+      },
+    }), 140, NOW));
+    assert.match(upperNanImg, /Image Quota: IMAGEN 3 .* 0% \(1h\)$/m);
+    assert.doesNotMatch(upperNanImg, /NaN%/);
+  });
+
+  test('renders 80-col CJK tables without wrapping, labels single Argon 5h, aligns models table, and handles 1h boundary', () => {
+    const providerQuotaAll = {
+      google: {
+        fiveHour: { remainingFraction: 0.42, resetTime: new Date(NOW + 59 * 60_000 + 42_000).toISOString() },
+        weekly: { remainingFraction: 0.55, resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString() },
+      },
+      claude: {
+        fiveHour: { remainingFraction: 0.1, resetTime: new Date(NOW + 42_000).toISOString() },
+        weekly: { remainingFraction: 0.88, resetTime: new Date(NOW + 7 * 86400_000).toISOString() },
+      },
+      argon: {
+        fiveHour: { remainingFraction: 0.9, resetTime: new Date(NOW + 4 * 3600_000).toISOString() },
+        weekly: { remainingFraction: 1, resetTime: new Date(NOW + 24 * 3600_000 + 5 * 60_000).toISOString() },
+      },
+    };
+
+    for (const language of ['zh-Hans', 'zh-Hant']) {
+      const tableOut = stripAnsi(renderPlain(baseCtx({
+        config: mergeConfig({
+          language,
+          display: { quotaStyle: 'table', showTier: false, showSessionSteps: false, showUpdateNotice: false },
+        }),
+        agyQuota: {
+          models: [],
+          providerQuota: providerQuotaAll,
+          unavailableReason: null,
+          tierName: null,
+          accountEmail: null,
+          updateInfo: null,
+        },
+      }), 80, NOW));
+
+      const lines = tableOut.split('\n');
+      const ruleLine = lines.find((line) => /^\s+─+$/.test(line));
+      assert.ok(ruleLine, `${language}: expected horizontal rule line in:\n${tableOut}`);
+      assert.equal(visibleWidth(ruleLine), 79, `${language}: rule line width must be 79 <= 80`);
+
+      const tableRows = lines.filter((line) => /^\s{2}(?:Google|Claude|Argon)\b.*│/.test(line));
+      assert.equal(tableRows.length, 3, `${language}: provider table rows must not wrap across lines:\n${tableOut}`);
+      const barColumns = new Set(tableRows.map((row) => visibleWidth(row.slice(0, row.indexOf('│')))));
+      assert.equal(barColumns.size, 1, `${language}: │ separators must align vertically`);
+      for (const row of tableRows) {
+        assert.ok(visibleWidth(row) <= 80, `${language}: row exceeds 80 cols (${visibleWidth(row)}): ${row}`);
+      }
+    }
+
+    // Single Argon 5h window renders 'Argon 5h' rather than 'Argon week'
+    const argonFiveOnly = stripAnsi(renderPlain(baseCtx({
+      config: mergeConfig({
+        language: 'en',
+        display: { quotaStyle: 'table', showTier: false, showSessionSteps: false, showUpdateNotice: false },
+      }),
+      agyQuota: {
+        models: [],
+        providerQuota: {
+          google: providerQuotaAll.google,
+          claude: providerQuotaAll.claude,
+          argon: {
+            fiveHour: { remainingFraction: 0.75, resetTime: new Date(NOW + 3 * 3600_000).toISOString() },
+          },
+        },
+        unavailableReason: null,
+        tierName: null,
+        accountEmail: null,
+        updateInfo: null,
+      },
+    }), 80, NOW));
+    assert.match(argonFiveOnly, /^\s+Argon 5h\s+█████░\s+75\.00%\s+~3h/m);
+    assert.doesNotMatch(argonFiveOnly, /Argon week/);
+
+    // Models table with default columnWidth (40) stays <= 80 cols and aligns ruleBar in both en and zh-Hans
+    for (const language of ['en', 'zh-Hans']) {
+      const modelsOut = stripAnsi(renderPlain(baseCtx({
+        config: mergeConfig({
+          language,
+          display: { quotaStyle: 'models', showTier: false, showSessionSteps: false, showUpdateNotice: false },
+        }),
+        agyQuota: {
+          ...baseCtx().agyQuota,
+          models: [
+            {
+              id: 'gemini-3-pro',
+              displayName: 'Gemini 3 Pro (High)',
+              remainingFraction: 0.5,
+              resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString(),
+              modelProvider: 'MODEL_PROVIDER_GOOGLE',
+            },
+            {
+              id: 'claude-sonnet-4-6',
+              displayName: 'Claude Sonnet 4.6 (High)',
+              remainingFraction: 0.75,
+              resetTime: new Date(NOW + 45_000).toISOString(),
+              modelProvider: 'MODEL_PROVIDER_ANTHROPIC',
+            },
+            {
+              id: 'gemini-3.5-flash',
+              displayName: 'Gemini 3.5 Flash (Low)',
+              remainingFraction: 0.9,
+              resetTime: new Date(NOW + 3 * 3600_000).toISOString(),
+              modelProvider: 'MODEL_PROVIDER_GOOGLE',
+            },
+            {
+              id: 'gpt-oss-120b',
+              displayName: 'GPT-OSS 120B (Medium)',
+              remainingFraction: 0.85,
+              resetTime: new Date(NOW + 4 * 3600_000).toISOString(),
+              modelProvider: 'MODEL_PROVIDER_OPENAI',
+            },
+          ],
+        },
+      }), 80, NOW));
+
+      const lines = modelsOut.split('\n');
+      const rules = lines.filter((line) => /^\s+─+$/.test(line));
+      assert.equal(rules.length, 2, `${language}: expected top and bottom rule bars`);
+      const ruleWidth = visibleWidth(rules[0]);
+      assert.equal(ruleWidth, 79, `${language}: default 80-col models ruleBar should be 79`);
+      assert.equal(visibleWidth(rules[1]), ruleWidth);
+
+      const modelRows = lines.filter((line) => /^\s{2}.*\d+\.\d{2}%.*│.*\d+\.\d{2}%/.test(line));
+      assert.equal(modelRows.length, 2, `${language}: expected 2 un-wrapped two-column rows:\n${modelsOut}`);
+      const barCols = new Set(modelRows.map((row) => visibleWidth(row.slice(0, row.indexOf('│')))));
+      assert.equal(barCols.size, 1, `${language}: models table │ must align vertically`);
+      for (const row of modelRows) {
+        assert.ok(visibleWidth(row) <= ruleWidth, `${language}: row width (${visibleWidth(row)}) must not exceed ruleBar (${ruleWidth}): ${row}`);
+        assert.ok(!row.endsWith(' '), `${language}: right column must not have trailing padding spaces: ${JSON.stringify(row)}`);
+      }
+    }
+
+    // Exact 1h (3_600_000ms) boundary in formatResetTime and computeNextRefreshDelay
+    const wc = wallClock(undefined);
+    assert.equal(formatResetTime(new Date(NOW + 3_599_000), 'relative', wc, NOW), '59m 59s');
+    assert.equal(formatResetTime(new Date(NOW + 3_600_000), 'relative', wc, NOW), '1h');
+    assert.equal(formatResetTime(new Date(NOW + 3_600_001), 'relative', wc, NOW), '1h 1m');
+
+    const exactHourDelay = computeNextRefreshDelay({
+      stdin: {
+        quota: {
+          'gemini-5h': { remaining_fraction: 0.5, reset_time: new Date(NOW + 3_600_000).toISOString() },
+        },
+      },
+    }, NOW);
+    assert.equal(exactHourDelay, 1_020, 'exact 1h boundary must schedule 1s tick instead of 30s minute check');
+  });
+
+  test('materializes reset_in_seconds across hostState and renderWorker ticks and blocks control/bidi chars in file links', async () => {
+    // 1. terminalFilter rejects file: links containing control or Unicode bidi characters
+    const filter = terminalFilter({});
+    const badFileCtrl = '\x1b]8;;file:///tmp/\nevil\x1b\\bad\x1b]8;;\x1b\\';
+    const badFileBidi = '\x1b]8;;file:///tmp/\u202eevil\x1b\\bidi\x1b]8;;\x1b\\';
+    const goodFile = '\x1b]8;;file:///tmp/my-repo\x1b\\ok\x1b]8;;\x1b\\';
+    assert.equal(filter(badFileCtrl), 'bad\x1b]8;;\x1b\\');
+    assert.equal(filter(badFileBidi), 'bidi\x1b]8;;\x1b\\');
+    assert.doesNotMatch(filter(badFileCtrl), /file:\/\//);
+    assert.doesNotMatch(filter(badFileBidi), /\u202e|file:\/\//);
+    assert.equal(filter(goodFile), goodFile);
+
+    // 2. reset_in_seconds counts down across repeated renderWorker ticks and materializes reset_time in hostState
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-rel-reset-'));
+    try {
+      const home = path.join(tmp, 'home');
+      const cwd = path.join(tmp, 'repo');
+      const agyCli = path.join(home, '.gemini', 'antigravity-cli');
+      const cfgDir = path.join(agyCli, 'agy-hud');
+      const hostStatePath = path.join(tmp, 'session', 'state.json');
+      fs.mkdirSync(cfgDir, { recursive: true });
+      fs.mkdirSync(cwd, { recursive: true });
+      fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify({
+        display: { quotaStyle: 'minimal', showMemoryUsage: false },
+      }));
+
+      const env = {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        AGY_HUD_DATA_DIR: agyCli,
+        AGY_HUD_HOST_STATE: hostStatePath,
+        COLUMNS: '100',
+        TZ: 'UTC',
+        LANG: 'en_US.UTF-8',
+      };
+
+      const stdinRelative = {
+        cwd,
+        model: { id: 'gemini-3-pro', display_name: 'Gemini 3 Pro' },
+        context_window: { context_window_size: 200_000, used_percentage: 25 },
+        quota: { 'gemini-5h': { remaining_fraction: 0.5, reset_in_seconds: 42 } },
+      };
+
+      const cliRes = spawnSync(process.execPath, [path.join(projectRoot, 'hud.mjs')], {
+        input: JSON.stringify(stdinRelative),
+        env,
+        encoding: 'utf8',
+      });
+      assert.equal(cliRes.status, 0, cliRes.stderr);
+      const savedState = JSON.parse(fs.readFileSync(hostStatePath, 'utf8'));
+      const savedBucket = savedState.stdin.quota['gemini-5h'];
+      assert.equal(savedBucket.reset_in_seconds, 42);
+      assert.equal(Date.parse(savedBucket.reset_time), savedState.seq + 42_000);
+
+      const worker = createRenderWorker({
+        env,
+        paths: collector.agyPaths(env),
+        createProbesFn: () => async (names) => {
+          const out = {};
+          for (const n of names) {
+            if (n === 'agy.unicode') out[n] = true;
+            else out[n] = null;
+          }
+          return out;
+        },
+      });
+      try {
+        const now0 = 1_700_000_000_000;
+        const r1 = await worker.renderSnapshot(stdinRelative, { now: now0, cols: 100 });
+        const r2 = await worker.renderSnapshot(stdinRelative, { now: now0 + 5_000, cols: 100 });
+        const r3 = await worker.renderSnapshot(stdinRelative, { now: now0 + 12_000, cols: 100 });
+        assert.match(r1.plainLines.join('\n'), /\(42s\)/);
+        assert.match(r2.plainLines.join('\n'), /\(37s\)/);
+        assert.match(r3.plainLines.join('\n'), /\(30s\)/);
+      } finally {
+        worker.close();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  test('default 76-col provider table avoids truncation and keeps vertical bars aligned in en and zh-Hans', () => {
+    const providerQuota = {
+      google: {
+        fiveHour: { remainingFraction: 0.42, resetTime: new Date(NOW + 59 * 60_000 + 42_000).toISOString() },
+        weekly: { remainingFraction: 0.55, resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString() },
+      },
+      claude: {
+        fiveHour: { remainingFraction: 0.1, resetTime: new Date(NOW + 42_000).toISOString() },
+        weekly: { remainingFraction: 0.88, resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString() },
+      },
+      argon: {
+        fiveHour: { remainingFraction: 1, resetTime: new Date(NOW + 4 * 3600_000).toISOString() },
+        weekly: { remainingFraction: 0.95, resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString() },
+      },
+    };
+
+    for (const language of ['en', 'zh-Hans']) {
+      const cfg = mergeConfig({ language });
+      assert.equal(cfg.display.quotaStyle, 'table');
+      const out = stripAnsi(renderPlain(baseCtx({
+        config: cfg,
+        agyQuota: {
+          ...baseCtx().agyQuota,
+          models: [],
+          providerQuota,
+        },
+      }), 76, NOW));
+
+      const lines = out.split('\n');
+      for (const line of lines) {
+        assert.ok(visibleWidth(line) <= 76, `${language}: line exceeds 76 columns (${visibleWidth(line)}): ${line}`);
+      }
+      const tableLines = lines.filter((line) => /^\s{2}(?:─+|(?:Google|Claude|Argon)\b)/.test(line));
+      assert.equal(tableLines.length, 4, `${language}: expected 4 provider table lines (rule + 3 rows):\n${out}`);
+      assert.doesNotMatch(tableLines.join('\n'), /\.{3}|…/, `${language}: 76-col provider table must not contain truncation ellipsis:\n${out}`);
+      assert.match(out, /Google week\s+[█░]{5}\s+55\.00%\s+~6d18h30m/);
+      assert.match(out, /Claude week\s+[█░]{5}\s+88\.00%\s+~6d18h30m/);
+      assert.match(out, /Argon week\s+[█░]{5}\s+95\.00%\s+~6d18h30m/);
+
+      const tableRows = tableLines.filter((line) => line.includes('│'));
+      assert.equal(tableRows.length, 3, `${language}: expected 3 un-wrapped provider table rows:\n${out}`);
+      const barColumns = new Set(tableRows.map((row) => visibleWidth(row.slice(0, row.indexOf('│')))));
+      assert.equal(barColumns.size, 1, `${language}: provider table │ must align vertically at 76 cols`);
+      assert.ok(!tableRows[0].endsWith(' '), `${language}: short right-column countdown must not have trailing padding`);
+    }
+
+    // Narrower widths (< 75 and < 65) also stay within frame width without ellipsis truncation
+    for (const width of [74, 64]) {
+      const out = stripAnsi(renderPlain(baseCtx({
+        config: mergeConfig({ language: 'en' }),
+        agyQuota: { ...baseCtx().agyQuota, models: [], providerQuota },
+      }), width, NOW));
+      const lines = out.split('\n');
+      for (const line of lines) {
+        assert.ok(visibleWidth(line) <= width, `width=${width}: line exceeds width (${visibleWidth(line)}): ${line}`);
+      }
+      const tableLines = lines.filter((line) => /^\s{2}(?:─+|(?:Google|Claude|Argon)\b)/.test(line));
+      assert.equal(tableLines.length, width === 64 ? 7 : 4, `width=${width}: unexpected provider table line count:\n${out}`);
+      assert.doesNotMatch(tableLines.join('\n'), /\.{3}|…/, `width=${width}: provider table should adapt without ellipsis:\n${out}`);
+    }
+  });
+
+  test('models table handles CJK full-width and surrogate-pair characters without lone surrogates or misaligned bars', () => {
+    const loneSurrogateRe = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+    assert.equal(truncateTextToWidth('通义千问Qwen测试模型😀', 12, '…'), '通义千问Qwe…');
+    assert.equal(textWidth('通义千问Qwe…'), 12);
+    assert.equal(truncateTextToWidth('通义千问Qwen测试😀', 17, '…'), '通义千问Qwen测试…');
+    assert.equal(textWidth('通义千问Qwen测试…'), 17);
+    assert.equal(truncateTextToWidth('通义', 2, '...'), '..');
+    assert.equal(truncateTextToWidth('通义', 0, '…'), '');
+
+    const cjkModels = [
+      {
+        id: 'qwen-test',
+        displayName: '通义千问Qwen测试模型😀',
+        remainingFraction: 0.6,
+        resetTime: new Date(NOW + 162 * 3600_000 + 30 * 60_000).toISOString(),
+        modelProvider: 'MODEL_PROVIDER_OPENAI',
+      },
+      {
+        id: 'gemini-3-pro',
+        displayName: 'Gemini 3 Pro (High)',
+        remainingFraction: 0.5,
+        resetTime: new Date(NOW + 45_000).toISOString(),
+        modelProvider: 'MODEL_PROVIDER_GOOGLE',
+      },
+      {
+        id: 'qwen-emoji-edge',
+        displayName: '通义千问Qwen测试😀',
+        remainingFraction: 0.8,
+        resetTime: new Date(NOW + 3 * 3600_000).toISOString(),
+        modelProvider: 'MODEL_PROVIDER_OPENAI',
+      },
+      {
+        id: 'claude-sonnet-4-6',
+        displayName: 'Claude Sonnet 4.6 (High)',
+        remainingFraction: 0.75,
+        resetTime: new Date(NOW + 4 * 3600_000).toISOString(),
+        modelProvider: 'MODEL_PROVIDER_ANTHROPIC',
+      },
+    ];
+
+    for (const language of ['en', 'zh-Hans']) {
+      for (const width of [80, 76]) {
+        const out = stripAnsi(renderPlain(baseCtx({
+          config: mergeConfig({
+            language,
+            display: { quotaStyle: 'models', showTier: false, showSessionSteps: false, showUpdateNotice: false },
+          }),
+          agyQuota: { ...baseCtx().agyQuota, models: cjkModels },
+        }), width, NOW));
+
+        assert.ok(out.isWellFormed(), `${language}@${width}: output must not contain lone surrogates`);
+        assert.doesNotMatch(out, loneSurrogateRe, `${language}@${width}: detected unpaired surrogate`);
+
+        const lines = out.split('\n');
+        for (const line of lines) {
+          assert.ok(visibleWidth(line) <= width, `${language}@${width}: line exceeds width (${visibleWidth(line)}): ${line}`);
+        }
+        const rules = lines.filter((line) => /^\s+─+$/.test(line));
+        assert.equal(rules.length, 2, `${language}@${width}: expected top and bottom rule bars`);
+        const ruleWidth = visibleWidth(rules[0]);
+
+        const modelRows = lines.filter((line) => /^\s{2}.*\d+\.\d{2}%.*│.*\d+\.\d{2}%/.test(line));
+        assert.equal(modelRows.length, 2, `${language}@${width}: expected 2 two-column model rows:\n${out}`);
+        const barCols = new Set(modelRows.map((row) => visibleWidth(row.slice(0, row.indexOf('│')))));
+        assert.equal(barCols.size, 1, `${language}@${width}: models table │ must align vertically`);
+        for (const row of modelRows) {
+          assert.ok(visibleWidth(row) <= ruleWidth, `${language}@${width}: row exceeds ruleWidth (${ruleWidth}): ${row}`);
+        }
+      }
+    }
+
+    // Surrogate pair boundary check: nameWidth=17 (columnWidth=41) drops 😀 cleanly; nameWidth=18 (columnWidth=42) preserves 😀
+    for (const [columnWidth, expectedNameRe] of [[41, /通义千问Qwen测试…/], [42, /通义千问Qwen测试😀/]]) {
+      const out = stripAnsi(renderPlain(baseCtx({
+        config: mergeConfig({ language: 'zh-Hans', display: { quotaStyle: 'models', columnWidth } }),
+        agyQuota: { ...baseCtx().agyQuota, models: cjkModels },
+      }), 140, NOW));
+      assert.ok(out.isWellFormed());
+      assert.doesNotMatch(out, loneSurrogateRe);
+      assert.match(out, expectedNameRe);
+      const modelRows = out.split('\n').filter((line) => /^\s{2}.*\d+\.\d{2}%.*│.*\d+\.\d{2}%/.test(line));
+      assert.equal(modelRows.length, 2);
+      const barCols = new Set(modelRows.map((row) => visibleWidth(row.slice(0, row.indexOf('│')))));
+      assert.equal(barCols.size, 1, `columnWidth=${columnWidth}: models table │ must align vertically`);
+    }
+
+    // Ultra-narrow (< 71) automatically falls back to single-column layout without overflowing
+    const narrowOut = stripAnsi(renderPlain(baseCtx({
+      config: mergeConfig({ language: 'zh-Hans', display: { quotaStyle: 'models' } }),
+      agyQuota: { ...baseCtx().agyQuota, models: cjkModels },
+    }), 70, NOW));
+    assert.ok(narrowOut.isWellFormed());
+    assert.doesNotMatch(narrowOut, loneSurrogateRe);
+    const narrowLines = narrowOut.split('\n');
+    for (const line of narrowLines) {
+      assert.ok(visibleWidth(line) <= 70, `70-col line exceeds 70 (${visibleWidth(line)}): ${line}`);
+    }
+    const narrowModelRows = narrowLines.filter((line) => /^\s{2}.*\d+\.\d{2}%/.test(line));
+    assert.equal(narrowModelRows.length, 4, `expected 4 single-column rows at 70 cols:\n${narrowOut}`);
+    for (const row of narrowModelRows) {
+      assert.ok(!row.includes('│'), `70-col single-column row must not contain │: ${row}`);
     }
   });
 });

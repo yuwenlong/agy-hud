@@ -50,11 +50,10 @@ function isWide(codePoint: number): boolean {
 }
 
 function isAmbiguous(codePoint: number): boolean {
-  return (codePoint >= 0x2010 && codePoint <= 0x2027)
+  return (codePoint >= 0x2010 && codePoint <= 0x2027 && codePoint !== 0x2026)
     || (codePoint >= 0x2030 && codePoint <= 0x205E)
     || (codePoint >= 0x2190 && codePoint <= 0x23FF)
-    || (codePoint >= 0x2460 && codePoint <= 0x24FF)
-    || (codePoint >= 0x2500 && codePoint <= 0x27BF);
+    || (codePoint >= 0x2460 && codePoint <= 0x24FF);
 }
 
 function graphemeWidth(grapheme: string, ambiguousWide: boolean): number {
@@ -93,7 +92,7 @@ export function stripAnsi(str: string): string {
   return tokenize(str).filter((token) => !token.escape).map((token) => token.text).join('');
 }
 
-function sliceToWidth(str: string, width: number): string {
+export function sliceToWidth(str: string, width: number): string {
   if (width <= 0) return '';
   const ambiguousWide = isCjkLanguage();
   let result = '';
@@ -110,6 +109,15 @@ function sliceToWidth(str: string, width: number): string {
     }
   }
   return result;
+}
+
+/** Truncate plain text to `width` terminal columns on grapheme boundaries using `ellipsis`. */
+export function truncateTextToWidth(str: string, width: number, ellipsis = '...'): string {
+  if (width <= 0) return '';
+  if (textWidth(str) <= width) return str;
+  const ellipsisWidth = textWidth(ellipsis);
+  if (ellipsisWidth > width) return sliceToWidth(ellipsis, width);
+  return `${sliceToWidth(str, width - ellipsisWidth)}${ellipsis}`;
 }
 
 function closeOpenHyperlink(str: string): string {

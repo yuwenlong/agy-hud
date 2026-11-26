@@ -256,22 +256,30 @@ export function agyQuotaToUsageData(
   const modelId = stdin.model?.id ?? '';
   const modelName = stdin.model?.display_name ?? '';
   const providerKey = matchProviderForModel(modelId, modelName);
-
-  const effectiveProviderKey: keyof AgyProviderQuotaSummary = probe.providerQuota?.[providerKey]
-    ? providerKey
-    : probe.providerQuota?.google
-      ? 'google'
-      : probe.providerQuota?.claude
-        ? 'claude'
-        : probe.providerQuota?.argon
-          ? 'argon'
-          : providerKey;
-  const pq: AgyProviderWindows | undefined = probe.providerQuota?.[effectiveProviderKey];
+  const ownPq = probe.providerQuota?.[providerKey];
+  const hasOwnProviderData = Boolean(ownPq && (ownPq.fiveHour || ownPq.weekly));
 
   const matchedModel = findMatchingModelQuota(probe.models ?? [], modelId, modelName);
-  const sevenDayLabel = effectiveProviderKey === 'argon' || (providerKey === 'argon' && matchedModel)
-    ? 'Argon 7d'
+  const hasMatchedModelQuota = Boolean(
+    matchedModel && (
+      isNonExpiredWindow(matchedModel.windows?.fiveHour, now)
+      || isNonExpiredWindow(matchedModel.windows?.weekly, now)
+      || matchedModel.windows?.fiveHour
+      || matchedModel.windows?.weekly
+      || Number.isFinite(matchedModel.remainingFraction)
+    ),
+  );
+
+  const fallbackProviderKey = !hasOwnProviderData && !hasMatchedModelQuota
+    ? (['google', 'claude', 'argon'] as const).find(
+        (k) => k !== providerKey && Boolean(probe.providerQuota?.[k]?.fiveHour || probe.providerQuota?.[k]?.weekly),
+      )
     : undefined;
+
+  const effectiveProviderKey: keyof AgyProviderQuotaSummary = fallbackProviderKey ?? providerKey;
+  const pq: AgyProviderWindows | undefined = probe.providerQuota?.[effectiveProviderKey];
+
+  const sevenDayLabel = effectiveProviderKey === 'argon' ? 'Argon 7d' : undefined;
 
   const fiveWin = isNonExpiredWindow(pq?.fiveHour, now)
     ? pq.fiveHour
@@ -286,20 +294,21 @@ export function agyQuotaToUsageData(
       : undefined;
 
   if (!fiveWin && !weekWin) {
-    if (matchedModel) {
+    const recoveredUsage = (): UsageData => ({
+      fiveHour: 0,
+      sevenDay: null,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+      ...(sevenDayLabel ? { sevenDayLabel } : {}),
+      fiveHourRemainingExact: 100,
+      sevenDayRemainingExact: null,
+    });
+    if (matchedModel && hasMatchedModelQuota) {
       const topTs = parseResetMs(matchedModel.resetTime);
       const topExpired = topTs !== null && topTs <= now;
       const hadModelWindows = Boolean(matchedModel.windows?.fiveHour || matchedModel.windows?.weekly);
       if (topExpired || hadModelWindows) {
-        return {
-          fiveHour: 0,
-          sevenDay: null,
-          fiveHourResetAt: null,
-          sevenDayResetAt: null,
-          ...(sevenDayLabel ? { sevenDayLabel } : {}),
-          fiveHourRemainingExact: 100,
-          sevenDayRemainingExact: null,
-        };
+        return recoveredUsage();
       }
       return {
         fiveHour: toUsedPercent(matchedModel.remainingFraction),
@@ -310,6 +319,9 @@ export function agyQuotaToUsageData(
         fiveHourRemainingExact: matchedModel.remainingFraction * 100,
         sevenDayRemainingExact: null,
       };
+    }
+    if (pq?.fiveHour || pq?.weekly) {
+      return recoveredUsage();
     }
     return null;
   }

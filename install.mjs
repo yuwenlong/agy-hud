@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { updateShellIntegration } from './runtime/shell.mjs';
 
 const SHELLS = ['posix', 'gitbash', 'powershell'];
 const LAUNCHER = fileURLToPath(new URL('./scripts/statusline.mjs', import.meta.url));
@@ -17,16 +18,26 @@ export function buildCmdShimContents(targetScriptPath, nodePath = process.execPa
   const lines = ['@echo off', 'setlocal'];
   if (typeof nodePath === 'string' && /^[A-Za-z]:\\/.test(nodePath) && !/["&|<>^%!]/.test(nodePath)) {
     lines.push(
-      `if exist "${nodePath}" (`,
-      `  "${nodePath}" "%~dp0${scriptName}" %*`,
-      '  exit /b %ERRORLEVEL%',
-      ')',
+      `if exist "${nodePath}" goto :use_pinned_node`,
+      'goto :find_path_node',
+      ':use_pinned_node',
+      `"${nodePath}" "%~dp0${scriptName}" %*`,
+      'exit /b %ERRORLEVEL%',
+      ':find_path_node',
     );
   }
   lines.push(
-    `node "%~dp0${scriptName}" %* 2>nul`,
-    'if %ERRORLEVEL%==0 exit /b 0',
-    `if exist "%ProgramFiles%\\nodejs\\node.exe" "%ProgramFiles%\\nodejs\\node.exe" "%~dp0${scriptName}" %*`,
+    'where node >nul 2>nul',
+    'if errorlevel 1 goto :check_program_files',
+    `node "%~dp0${scriptName}" %*`,
+    'exit /b %ERRORLEVEL%',
+    ':check_program_files',
+    'if exist "%ProgramFiles%\\nodejs\\node.exe" goto :use_program_files',
+    'echo agy-hud: node.exe not found on PATH or in "%ProgramFiles%\\nodejs\\node.exe". 1>&2',
+    'exit /b 9009',
+    ':use_program_files',
+    `"%ProgramFiles%\\nodejs\\node.exe" "%~dp0${scriptName}" %*`,
+    'exit /b %ERRORLEVEL%',
     '',
   );
   return lines.join('\r\n');
@@ -137,7 +148,7 @@ function readSettings(file) {
 
 /**
  * Installs launcher next to HUD's persistent dir and writes statusLine into settings.json.
- * argv: [--shell posix|gitbash|powershell] [--replace]
+ * argv: [--shell posix|gitbash|powershell] [--replace] [--shell-wrap]
  */
 export function install({ configDir, hudDir, argv = [], env = process.env, launcherTarget }) {
   const flag = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined);
@@ -186,5 +197,9 @@ export function install({ configDir, hudDir, argv = [], env = process.env, launc
   fs.writeFileSync(temp, `${JSON.stringify({ ...settings, statusLine }, null, 2)}\n`, { mode });
   fs.chmodSync(temp, mode);
   fs.renameSync(temp, target);
+
+  if (argv.includes('--shell-wrap')) {
+    report.shellIntegration = updateShellIntegration(configDir, 'install', env);
+  }
   return report;
 }

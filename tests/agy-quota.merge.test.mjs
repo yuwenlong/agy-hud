@@ -323,4 +323,179 @@ describe('agy-quota / pickFresherQuotaWindow & mergeAgyQuotaProbe', () => {
     assert.equal(usage?.fiveHourResetAt, null);
     assert.equal(usage?.fiveHourRemainingExact, 100);
   });
+
+  test('agyQuotaToUsageData recovers to 100% when providerQuota windows are all expired and matchedModel is absent', () => {
+    const pastIso = new Date(now - 5_000).toISOString();
+
+    const expiredPqOnlyProbe = {
+      models: [],
+      providerQuota: {
+        google: {
+          fiveHour: { remainingFraction: 0, resetTime: pastIso },
+          weekly: { remainingFraction: 0.4, resetTime: pastIso },
+        },
+      },
+      unavailableReason: null,
+      tierName: 'Pro',
+      accountEmail: null,
+      updateInfo: null,
+    };
+    assert.deepEqual(
+      agyQuotaToUsageData(expiredPqOnlyProbe, { model: { id: 'gemini-3-pro' } }, now),
+      {
+        fiveHour: 0,
+        sevenDay: null,
+        fiveHourResetAt: null,
+        sevenDayResetAt: null,
+        fiveHourRemainingExact: 100,
+        sevenDayRemainingExact: null,
+      },
+    );
+
+    const expiredArgonProbe = {
+      models: [],
+      providerQuota: {
+        argon: {
+          weekly: { remainingFraction: 0, resetTime: pastIso },
+        },
+      },
+      unavailableReason: null,
+      tierName: 'Pro',
+      accountEmail: null,
+      updateInfo: null,
+    };
+    assert.deepEqual(
+      agyQuotaToUsageData(
+        expiredArgonProbe,
+        { model: { id: 'gemini-4-argon-medium', display_name: 'Gemini 4 Argon (Medium)' } },
+        now,
+      ),
+      {
+        fiveHour: 0,
+        sevenDay: null,
+        fiveHourResetAt: null,
+        sevenDayResetAt: null,
+        sevenDayLabel: 'Argon 7d',
+        fiveHourRemainingExact: 100,
+        sevenDayRemainingExact: null,
+      },
+    );
+
+    // Without matchedModel or any providerQuota window, still returns null
+    const emptyProbe = {
+      models: [],
+      providerQuota: null,
+      unavailableReason: null,
+      tierName: 'Pro',
+      accountEmail: null,
+      updateInfo: null,
+    };
+    assert.equal(agyQuotaToUsageData(emptyProbe, { model: { id: 'gemini-3-pro' } }, now), null);
+  });
+
+  test('does not fall back to another providerQuota when matchedModel has its own quota and avoids mislabeling fallback as Argon 7d', () => {
+    const googleOnlyPq = {
+      google: {
+        fiveHour: { remainingFraction: 0.95, resetTime: fiveHourReset },
+        weekly: { remainingFraction: 0.85, resetTime: weeklyReset },
+      },
+    };
+
+    // 1. Claude model with matchedModel windows is not overwritten by Google providerQuota
+    const claudeWindowProbe = {
+      models: [
+        {
+          id: 'claude-sonnet-4-6',
+          displayName: 'Claude Sonnet 4.6',
+          modelProvider: 'MODEL_PROVIDER_ANTHROPIC',
+          remainingFraction: 0.2,
+          resetTime: fiveHourReset,
+          windows: {
+            fiveHour: { remainingFraction: 0.2, resetTime: fiveHourReset },
+          },
+        },
+      ],
+      providerQuota: googleOnlyPq,
+      unavailableReason: null,
+      tierName: 'Pro',
+      accountEmail: null,
+      updateInfo: null,
+    };
+    const claudeWindowUsage = agyQuotaToUsageData(
+      claudeWindowProbe,
+      { model: { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' } },
+      now,
+    );
+    assert.equal(claudeWindowUsage?.fiveHour, 80);
+    assert.equal(claudeWindowUsage?.sevenDay, null);
+    assert.equal(claudeWindowUsage?.sevenDayLabel, undefined);
+
+    // 2. Claude model with only top-level remainingFraction is not overwritten by Google providerQuota
+    const claudeTopLevelProbe = {
+      ...claudeWindowProbe,
+      models: [
+        {
+          id: 'claude-sonnet-4-6',
+          displayName: 'Claude Sonnet 4.6',
+          modelProvider: 'MODEL_PROVIDER_ANTHROPIC',
+          remainingFraction: 0.35,
+          resetTime: fiveHourReset,
+        },
+      ],
+    };
+    const claudeTopLevelUsage = agyQuotaToUsageData(
+      claudeTopLevelProbe,
+      { model: { id: 'claude-sonnet-4-6', display_name: 'Claude Sonnet 4.6' } },
+      now,
+    );
+    assert.equal(claudeTopLevelUsage?.fiveHour, 65);
+    assert.equal(claudeTopLevelUsage?.sevenDay, null);
+
+    // 3. Argon model with matchedModel uses Argon's quota and Argon 7d label instead of Google
+    const argonModelProbe = {
+      models: [
+        {
+          id: 'gemini-4-argon-medium',
+          displayName: 'Gemini 4 Argon (Medium)',
+          modelProvider: 'MODEL_PROVIDER_GOOGLE',
+          remainingFraction: 0.3,
+          resetTime: weeklyReset,
+          windows: {
+            weekly: { remainingFraction: 0.3, resetTime: weeklyReset },
+          },
+        },
+      ],
+      providerQuota: googleOnlyPq,
+      unavailableReason: null,
+      tierName: 'Pro',
+      accountEmail: null,
+      updateInfo: null,
+    };
+    const argonModelUsage = agyQuotaToUsageData(
+      argonModelProbe,
+      { model: { id: 'gemini-4-argon-medium', display_name: 'Gemini 4 Argon (Medium)' } },
+      now,
+    );
+    assert.equal(argonModelUsage?.fiveHour, null);
+    assert.equal(argonModelUsage?.sevenDay, 70);
+    assert.equal(argonModelUsage?.sevenDayLabel, 'Argon 7d');
+
+    // 4. Argon model falling back to Google when both providerQuota.argon and matchedModel are absent must NOT emit Argon 7d
+    const argonFallbackProbe = {
+      models: [],
+      providerQuota: googleOnlyPq,
+      unavailableReason: null,
+      tierName: 'Pro',
+      accountEmail: null,
+      updateInfo: null,
+    };
+    const argonFallbackUsage = agyQuotaToUsageData(
+      argonFallbackProbe,
+      { model: { id: 'gemini-4-argon-medium', display_name: 'Gemini 4 Argon (Medium)' } },
+      now,
+    );
+    assert.equal(argonFallbackUsage?.fiveHour, 5);
+    assert.equal(argonFallbackUsage?.sevenDay, 15);
+    assert.equal(argonFallbackUsage?.sevenDayLabel, undefined);
+  });
 });

@@ -12,15 +12,26 @@ export function wallClock(display: Partial<HudConfig['display']> | undefined): W
 }
 
 function formatDuration(ms: number): string {
-  const totalMins = Math.ceil(ms / 60000);
-  if (totalMins < 60) return `${totalMins}m`;
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const totalSecs = Math.ceil(ms / 1000);
+  if (totalSecs < 3600) {
+    if (totalSecs < 60) return `${totalSecs}s`;
+    const mins = Math.floor(totalSecs / 60);
+    const secs = totalSecs % 60;
+    return `${mins}m ${secs}s`;
+  }
+  const totalMins = totalSecs === 3600 ? 60 : Math.ceil(ms / 60000);
   const hours = Math.floor(totalMins / 60);
   const mins = totalMins % 60;
-  if (hours >= 24) {
-    const days = Math.floor(hours / 24);
-    return hours % 24 > 0 ? `${days}d ${hours % 24}h` : `${days}d`;
+  if (hours < 24) {
+    return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
   }
-  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  if (remHours === 0) {
+    return mins > 0 ? `${days}d 0h ${mins}m` : `${days}d`;
+  }
+  return mins > 0 ? `${days}d ${remHours}h ${mins}m` : `${days}d ${remHours}h`;
 }
 
 export function formatAbsoluteTime(

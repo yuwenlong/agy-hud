@@ -8,7 +8,7 @@ import nodeModule from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { getAntigravityRoots } from './runtime/paths.mjs';
+import { expandHome, getAntigravityRoots } from './runtime/paths.mjs';
 import { detectUnicodeSupport } from './runtime/encoding.mjs';
 import { getQuota, resolveActiveAccountSummary } from './runtime/quota.mjs';
 import { getLocalPackageVersion, isRemoteVersionNewer } from './runtime/update-checker.mjs';
@@ -18,7 +18,6 @@ export const GIT_MAX_OUTPUT_BYTES = 1024 * 1024;
 const TREE_KILL_TIMEOUT_MS = 1000;
 const WORKER_STARTUP_MS = 1500;
 
-const expandHome = (p, home) => (p === '~' ? home : p.startsWith('~/') || p.startsWith('~\\') ? path.join(home, p.slice(2)) : p);
 const homeOf = (env) => (process.platform === 'win32' ? env.USERPROFILE : env.HOME) || os.homedir();
 
 export function agyPaths(env = process.env, home = homeOf(env)) {
@@ -44,9 +43,26 @@ export function agyPaths(env = process.env, home = homeOf(env)) {
   };
 }
 
+export function realpathNative(target) {
+  if (typeof fs.realpathSync.native === 'function') {
+    try {
+      return fs.realpathSync.native(target);
+    } catch {}
+  }
+  return fs.realpathSync(target);
+}
+
+function pushRealpaths(grants, target) {
+  if (typeof target !== 'string' || !target) return;
+  try { grants.push(fs.realpathSync(target)); } catch {}
+  if (typeof fs.realpathSync.native === 'function') {
+    try { grants.push(fs.realpathSync.native(target)); } catch {}
+  }
+}
+
 export const samePath = (a, b) => {
   try {
-    return fs.realpathSync(a) === fs.realpathSync(b);
+    return realpathNative(a) === realpathNative(b);
   } catch {
     return path.resolve(a) === path.resolve(b);
   }
@@ -354,6 +370,91 @@ function isInsideRoot(filePath, rootDir) {
   return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+const PROJECT_DIR_KEYS = [
+  'rules',
+  'geminiRules',
+  'agentsRules',
+  'cursorRules',
+  'githubRules',
+  'agents',
+  'geminiAgents',
+  'agentsAgents',
+];
+const PROJECT_ROOT_FILE_KEYS = [
+  'claudeMd',
+  'localMd',
+  'agentsMd',
+  'geminiMd',
+  'memoryMd',
+  'mcpJson',
+  'localAgyHudConfig',
+];
+const PROJECT_DOT_CLAUDE_FILE_KEYS = ['dotClaudeMd', 'dotLocalMd', 'settings', 'localSettings'];
+const PROJECT_DIR_SUFFIXES = {
+  rules: ['.claude', 'rules'],
+  geminiRules: ['.gemini', 'rules'],
+  agentsRules: ['.agents', 'rules'],
+  cursorRules: ['.cursor', 'rules'],
+  githubRules: ['.github', 'rules'],
+  agents: ['.claude', 'agents'],
+  geminiAgents: ['.gemini', 'agents'],
+  agentsAgents: ['.agents', 'agents'],
+};
+
+function collectRealpaths(target) {
+  const resolved = [];
+  if (typeof target !== 'string' || !target) return resolved;
+  try {
+    resolved.push(fs.realpathSync(target));
+  } catch {}
+  if (typeof fs.realpathSync.native === 'function') {
+    try {
+      const nativePath = fs.realpathSync.native(target);
+      if (!resolved.includes(nativePath)) resolved.push(nativePath);
+    } catch {}
+  }
+  return resolved;
+}
+
+function isSafeProjectDir(dir, cwdRoots) {
+  if (typeof dir !== 'string' || !dir || cwdRoots.length === 0) return false;
+  const realPaths = collectRealpaths(dir);
+  if (realPaths.length === 0) return false;
+  try {
+    if (!realPaths.every((real) => fs.statSync(real).isDirectory())) return false;
+  } catch {
+    return false;
+  }
+  return realPaths.every((real) => cwdRoots.some((rootDir) => isInsideRoot(real, rootDir)));
+}
+
+function inferProjectCwd(project) {
+  if (!project || typeof project !== 'object') return null;
+  if (typeof project.cwd === 'string' && project.cwd) return project.cwd;
+  for (const key of PROJECT_ROOT_FILE_KEYS) {
+    if (typeof project[key] === 'string' && project[key]) {
+      return path.dirname(project[key]);
+    }
+  }
+  for (const key of PROJECT_DOT_CLAUDE_FILE_KEYS) {
+    if (typeof project[key] === 'string' && project[key]) {
+      const parent = path.dirname(project[key]);
+      if (path.basename(parent) === '.claude') return path.dirname(parent);
+    }
+  }
+  for (const [key, [vendorDir, leafDir]] of Object.entries(PROJECT_DIR_SUFFIXES)) {
+    const val = project[key];
+    if (typeof val === 'string' && val) {
+      const normalized = path.resolve(val);
+      const parent = path.dirname(normalized);
+      if (path.basename(normalized) === leafDir && path.basename(parent) === vendorDir) {
+        return path.dirname(parent);
+      }
+    }
+  }
+  return null;
+}
+
 function resolveSafeTodoFiles({ rawTodoPaths, cwd, projectDir, convBrainDirs, home }) {
   if (!Array.isArray(rawTodoPaths) || rawTodoPaths.length === 0) return [];
   const safeRoots = new Set();
@@ -419,6 +520,8 @@ export function logicPaths(paths, input) {
   if (cwd) {
     const claudeDir = path.join(cwd, '.claude');
     const ownClaude = !samePath(claudeDir, paths.claudeConfigDir);
+    const cwdRoots = collectRealpaths(cwd);
+    const safeProjectDir = (dir) => (isSafeProjectDir(dir, cwdRoots) ? dir : null);
     project = {
       claudeMd: path.join(cwd, 'CLAUDE.md'),
       localMd: path.join(cwd, 'CLAUDE.local.md'),
@@ -429,14 +532,14 @@ export function logicPaths(paths, input) {
       localAgyHudConfig: path.join(cwd, 'agy-hud.config.json'),
       dotClaudeMd: ownClaude ? path.join(claudeDir, 'CLAUDE.md') : null,
       dotLocalMd: path.join(claudeDir, 'CLAUDE.local.md'),
-      rules: ownClaude ? path.join(claudeDir, 'rules') : null,
-      geminiRules: path.join(cwd, '.gemini', 'rules'),
-      agentsRules: path.join(cwd, '.agents', 'rules'),
-      cursorRules: path.join(cwd, '.cursor', 'rules'),
-      githubRules: path.join(cwd, '.github', 'rules'),
-      agents: ownClaude ? path.join(claudeDir, 'agents') : null,
-      geminiAgents: path.join(cwd, '.gemini', 'agents'),
-      agentsAgents: path.join(cwd, '.agents', 'agents'),
+      rules: ownClaude ? safeProjectDir(path.join(claudeDir, 'rules')) : null,
+      geminiRules: safeProjectDir(path.join(cwd, '.gemini', 'rules')),
+      agentsRules: safeProjectDir(path.join(cwd, '.agents', 'rules')),
+      cursorRules: safeProjectDir(path.join(cwd, '.cursor', 'rules')),
+      githubRules: safeProjectDir(path.join(cwd, '.github', 'rules')),
+      agents: ownClaude ? safeProjectDir(path.join(claudeDir, 'agents')) : null,
+      geminiAgents: safeProjectDir(path.join(cwd, '.gemini', 'agents')),
+      agentsAgents: safeProjectDir(path.join(cwd, '.agents', 'agents')),
       settings: ownClaude ? path.join(claudeDir, 'settings.json') : null,
       localSettings: path.join(claudeDir, 'settings.local.json'),
     };
@@ -485,25 +588,35 @@ export function logicPaths(paths, input) {
 
 export function readGrants(root, named) {
   const flat = (value) => (value && typeof value === 'object' ? Object.values(value).flatMap(flat) : typeof value === 'string' ? [value] : []);
-  const grants = [root, ...flat(named)];
+  const project = named?.project && typeof named.project === 'object' ? { ...named.project } : null;
+  const safeProjectDirs = [];
+  if (project) {
+    const cwdRoots = collectRealpaths(inferProjectCwd(project));
+    for (const key of PROJECT_DIR_KEYS) {
+      const candidate = project[key];
+      if (typeof candidate === 'string' && candidate && isSafeProjectDir(candidate, cwdRoots)) {
+        safeProjectDirs.push(candidate);
+      } else if (Object.hasOwn(project, key)) {
+        project[key] = null;
+      }
+    }
+  }
+  const sanitizedNamed = named && typeof named === 'object' ? { ...named, ...(project ? { project } : {}) } : named;
+  const grants = [root, ...flat(sanitizedNamed)];
+  pushRealpaths(grants, root);
+  pushRealpaths(grants, named?.data);
+  pushRealpaths(grants, named?.stripped);
   const dirGrants = [
-    named.user?.rules,
-    named.user?.agyRules,
-    named.user?.agents,
-    named.user?.agyConfigAgents,
-    named.user?.agyAgents,
-    named.user?.agyCliAgents,
-    named.project?.rules,
-    named.project?.geminiRules,
-    named.project?.agentsRules,
-    named.project?.cursorRules,
-    named.project?.githubRules,
-    named.project?.agents,
-    named.project?.geminiAgents,
-    named.project?.agentsAgents,
+    named?.user?.rules,
+    named?.user?.agyRules,
+    named?.user?.agents,
+    named?.user?.agyConfigAgents,
+    named?.user?.agyAgents,
+    named?.user?.agyCliAgents,
+    ...safeProjectDirs,
   ].filter(Boolean);
   for (const dir of dirGrants) {
-    try { grants.push(fs.realpathSync(dir)); } catch {}
+    pushRealpaths(grants, dir);
   }
   return [...new Set(grants)];
 }
@@ -530,7 +643,7 @@ export function prepareDataDir({ configDir, hudDir, dataDir }) {
     }
   };
   sweep(dataDir);
-  return fs.realpathSync(dataDir);
+  return realpathNative(dataDir);
 }
 
 export const strippedName = (source) => `${crypto.hash('sha256', `${process.version}\0${source}`)}.js`;

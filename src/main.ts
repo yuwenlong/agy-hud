@@ -1,5 +1,5 @@
 import * as fs from 'node:fs';
-import { createChannel, type Ask, type Paths, type Probe } from './channel.ts';
+import { createChannel, type Ask, type InitMessage, type Paths, type Probe, type ReplyMessage } from './channel.ts';
 import { readAuthInfo } from './auth.ts';
 import { agyQuotaToUsageData, mergeAgyQuotaProbe } from './agy-quota.ts';
 import { runHudCommand } from './commands.ts';
@@ -79,6 +79,7 @@ export async function renderStdin(
   paths: Paths,
   ask: Ask,
   now = Date.now(),
+  explicitCols?: number | null,
 ): Promise<{ lines: string[]; snapshot: ReturnType<typeof externalUsageSnapshot>; failed: boolean }> {
   const loaded = loadConfigFiles(paths);
   const config = loaded.config;
@@ -160,7 +161,11 @@ export async function renderStdin(
     : null;
 
   const unicodeSupported = typeof probeAnswers['agy.unicode'] === 'boolean' ? probeAnswers['agy.unicode'] : true;
-  const cols = getTerminalWidth() ?? (typeof stdin.terminal_width === 'number' && stdin.terminal_width > 0 ? Math.min(1000, Math.floor(stdin.terminal_width)) : null);
+  const cols = (typeof explicitCols === 'number' && Number.isFinite(explicitCols) && explicitCols > 0
+    ? Math.min(1000, Math.floor(explicitCols))
+    : null)
+    ?? getTerminalWidth()
+    ?? (typeof stdin.terminal_width === 'number' && stdin.terminal_width > 0 ? Math.min(1000, Math.floor(stdin.terminal_width)) : null);
 
   const ctx: RenderContext = {
     stdin,
@@ -191,23 +196,38 @@ export async function renderStdin(
   return { lines, snapshot, failed: loaded.problems.length > 0 };
 }
 
-export async function runMain(): Promise<void> {
-  const { init, ask, reply } = createChannel();
-  const msg = await init;
-
+async function handleRequest(msg: InitMessage, ask: Ask): Promise<ReplyMessage> {
   if (msg.command) {
-    const result = await runHudCommand(msg.command, msg.paths, ask, msg.now);
-    reply(result);
-    return;
+    return runHudCommand(msg.command, msg.paths, ask, msg.now);
   }
-
   if (!msg.stdin) {
-    reply({ lines: [] });
-    return;
+    return { lines: [] };
   }
+  return renderStdin(msg.stdin, msg.paths, ask, msg.now, msg.cols);
+}
 
-  const out = await renderStdin(msg.stdin, msg.paths, ask, msg.now);
-  reply(out);
+async function replyRequest(req: InitMessage, ask: Ask, reply: (msg: ReplyMessage) => void): Promise<void> {
+  try {
+    reply(await handleRequest(req, ask));
+  } catch {
+    reply({ lines: [], failed: true });
+  }
+}
+
+export async function runMain(): Promise<void> {
+  const { init, ask, reply, nextRequest } = createChannel();
+  const first = await init;
+  const persistent = first.persistent === true;
+
+  await replyRequest(first, ask, reply);
+
+  if (!persistent) return;
+
+  while (true) {
+    const req = await nextRequest();
+    if (!req) break;
+    await replyRequest(req, ask, reply);
+  }
 }
 
 const isEntrypoint = Boolean(process.argv[1] && process.argv[1].endsWith('main.ts') && !fs.lstatSync(process.argv[1], { throwIfNoEntry: false })?.isDirectory());

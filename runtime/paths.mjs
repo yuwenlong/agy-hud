@@ -2,6 +2,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+export function expandHome(p, home = os.homedir()) {
+  if (typeof p !== 'string') return p;
+  return p === '~' ? home : p.startsWith('~/') || p.startsWith('~\\') ? path.join(home, p.slice(2)) : p;
+}
+
+export function isHudDisabled(env = process.env) {
+  const value = (env?.AGY_HUD_DISABLE ?? env?.CLAUDE_HUD_DISABLE)?.trim().toLowerCase();
+  return Boolean(value) && !['0', 'false', 'off', 'no'].includes(value);
+}
+
 /**
  * Return all candidate antigravity-cli data roots, ordered by priority:
  *   1. $AGY_HUD_DATA_DIR (explicit override)

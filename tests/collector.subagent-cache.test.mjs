@@ -273,15 +273,125 @@ describe('collector / subagent map cache, stripLogic tmp guard & version sync', 
     }
   });
 
-  test('manifest versions are synchronized at 0.4.10', () => {
+  test('logicPaths and readGrants reject escaped project rule/agent symlinks while keeping in-repo dirs', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-project-grants-'));
+    const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+    try {
+      const home = path.join(tmp, 'home');
+      const configDir = path.join(home, '.gemini', 'antigravity-cli');
+      const claudeConfigDir = path.join(home, '.claude');
+      const cwd = path.join(tmp, 'workspace', 'repo');
+      const outsideSecret = path.join(tmp, 'outside-secret');
+      const outsideRules = path.join(outsideSecret, 'rules');
+      const outsideAgents = path.join(outsideSecret, 'agents');
+
+      fs.mkdirSync(configDir, { recursive: true });
+      fs.mkdirSync(claudeConfigDir, { recursive: true });
+      fs.mkdirSync(outsideRules, { recursive: true });
+      fs.mkdirSync(outsideAgents, { recursive: true });
+      fs.writeFileSync(path.join(configDir, 'antigravity-oauth-token'), '{"access_token":"secret"}');
+
+      const realGeminiRules = path.join(cwd, '.gemini', 'rules');
+      const realAgentsAgents = path.join(cwd, '.agents', 'agents');
+      const sharedInRepoRules = path.join(cwd, 'shared-rules');
+      fs.mkdirSync(realGeminiRules, { recursive: true });
+      fs.mkdirSync(realAgentsAgents, { recursive: true });
+      fs.mkdirSync(sharedInRepoRules, { recursive: true });
+      fs.mkdirSync(path.join(cwd, '.cursor'), { recursive: true });
+      fs.mkdirSync(path.join(cwd, '.claude'), { recursive: true });
+      fs.mkdirSync(path.join(cwd, '.github'), { recursive: true });
+      fs.mkdirSync(path.join(cwd, '.agents'), { recursive: true });
+
+      const cursorRulesLink = path.join(cwd, '.cursor', 'rules');
+      const claudeAgentsLink = path.join(cwd, '.claude', 'agents');
+      const githubRulesLink = path.join(cwd, '.github', 'rules');
+      const inRepoRulesLink = path.join(cwd, '.agents', 'rules');
+
+      fs.symlinkSync(outsideRules, cursorRulesLink, linkType);
+      fs.symlinkSync(outsideAgents, claudeAgentsLink, linkType);
+      fs.symlinkSync(configDir, githubRulesLink, linkType);
+      fs.symlinkSync(sharedInRepoRules, inRepoRulesLink, linkType);
+
+      const paths = {
+        home,
+        configDir,
+        claudeConfigDir,
+        hudDir: path.join(configDir, 'agy-hud'),
+        claudeJson: path.join(home, '.claude.json'),
+        dataDir: path.join(configDir, 'agy-hud', 'data'),
+        strippedDir: path.join(configDir, 'agy-hud', 'stripped'),
+        configPath: path.join(configDir, 'agy-hud', 'config.json'),
+        overridePath: path.join(configDir, 'agy-hud.json'),
+        legacyConfigPath: path.join(configDir, 'legacy.json'),
+        heartbeat: path.join(configDir, 'agy-hud', 'heartbeat.json'),
+      };
+
+      const named = logicPaths(paths, { cwd });
+      assert.equal(named.project.cursorRules, null, 'escaped .cursor/rules symlink must be nulled');
+      assert.equal(named.project.agents, null, 'escaped .claude/agents symlink must be nulled');
+      assert.equal(named.project.githubRules, null, 'escaped .github/rules symlink must be nulled');
+      assert.equal(named.project.rules, null, 'non-existent .claude/rules must be nulled');
+      assert.equal(named.project.geminiAgents, null, 'non-existent .gemini/agents must be nulled');
+      assert.equal(named.project.geminiRules, realGeminiRules);
+      assert.equal(named.project.agentsAgents, realAgentsAgents);
+      assert.equal(named.project.agentsRules, inRepoRulesLink);
+
+      const grants = readGrants(ROOT, named);
+      assert.equal(grants.includes(fs.realpathSync(realGeminiRules)), true);
+      assert.equal(grants.includes(fs.realpathSync(realAgentsAgents)), true);
+      assert.equal(grants.includes(fs.realpathSync(sharedInRepoRules)), true);
+
+      for (const forbidden of [
+        cursorRulesLink,
+        claudeAgentsLink,
+        githubRulesLink,
+        outsideRules,
+        outsideAgents,
+        configDir,
+        fs.realpathSync(outsideRules),
+        fs.realpathSync(outsideAgents),
+        fs.realpathSync(configDir),
+        path.join(cwd, '.claude', 'rules'),
+        path.join(cwd, '.gemini', 'agents'),
+      ]) {
+        assert.equal(grants.includes(forbidden), false, `must not grant ${forbidden}`);
+      }
+
+      // Direct readGrants defense-in-depth when caller passes self-constructed named.project
+      const forgedNamed = {
+        project: {
+          claudeMd: path.join(cwd, 'CLAUDE.md'),
+          cursorRules: cursorRulesLink,
+          agents: claudeAgentsLink,
+          geminiRules: realGeminiRules,
+        },
+      };
+      const forgedGrants = readGrants(ROOT, forgedNamed);
+      assert.equal(forgedGrants.includes(fs.realpathSync(realGeminiRules)), true);
+      assert.equal(forgedGrants.includes(cursorRulesLink), false);
+      assert.equal(forgedGrants.includes(claudeAgentsLink), false);
+      assert.equal(forgedGrants.includes(fs.realpathSync(outsideRules)), false);
+      assert.equal(forgedGrants.includes(fs.realpathSync(outsideAgents)), false);
+      assert.equal(forgedNamed.project.cursorRules, cursorRulesLink, 'readGrants must not mutate caller input');
+
+      // Minimal forged named.project without anchor files or valid subdir structure
+      const unanchoredGrants = readGrants(ROOT, { project: { cursorRules: outsideRules } });
+      assert.equal(unanchoredGrants.includes(outsideRules), false);
+      assert.equal(unanchoredGrants.includes(fs.realpathSync(outsideRules)), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('manifest versions are synchronized at 0.4.11', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
     const plugin = JSON.parse(fs.readFileSync(path.join(ROOT, 'plugin.json'), 'utf8'));
     const ext = JSON.parse(fs.readFileSync(path.join(ROOT, 'gemini-extension.json'), 'utf8'));
 
-    assert.equal(pkg.version, '0.4.10');
-    assert.equal(lock.version, '0.4.10');
-    assert.equal(lock.packages?.['']?.version, '0.4.10');
+    assert.equal(pkg.version, '0.4.11');
+    assert.equal(lock.version, '0.4.11');
+    assert.equal(lock.packages?.['']?.version, '0.4.11');
     assert.equal(plugin.version, pkg.version);
     assert.equal(ext.version, pkg.version);
   });

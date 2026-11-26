@@ -1,5 +1,5 @@
+import { isAgyImageModel } from '../agy-quota.ts';
 import { t } from '../i18n/index.ts';
-import type { AgyModelQuota } from '../types.ts';
 import { formatTokens } from '../utils/format.ts';
 import { sanitizeDisplayText } from '../utils/sanitize.ts';
 import type { Frame } from './frame.ts';
@@ -143,10 +143,6 @@ export function compactionsLine(f: Frame): string | null {
   return compactionsPart(f);
 }
 
-function isImageModel(q: AgyModelQuota): boolean {
-  return Boolean(q.id?.includes('image') || q.displayName?.toLowerCase().includes('image'));
-}
-
 export function imageQuotaLine(f: Frame): string | null {
   if (f.config?.display?.showImageQuota !== true) return null;
   const colors = f.config?.colors;
@@ -166,15 +162,21 @@ export function imageQuotaLine(f: Frame): string | null {
       return `${label(`${t('label.imageQuota')}:`, colors)} ${critical(t('status.imageExhausted') + resetPart, colors)}`;
     }
   }
-  const imgModel = f.agyQuota?.models?.find(isImageModel);
+  const imgModel = f.agyQuota?.models?.find((q) => isAgyImageModel(q.id, q.displayName));
   if (!imgModel) return null;
-  const remaining = Math.floor(Math.min(1, Math.max(0, imgModel.remainingFraction)) * 100);
+  const resetMs = imgModel.resetTime ? Date.parse(imgModel.resetTime) : Number.NaN;
+  const resetExpired = Number.isFinite(resetMs) && resetMs <= f.now;
+  const remaining = resetExpired
+    ? 100
+    : Number.isFinite(imgModel.remainingFraction)
+      ? Math.floor(Math.min(1, Math.max(0, imgModel.remainingFraction)) * 100)
+      : 0;
   const used = 100 - remaining;
   const color = getQuotaColor(used, colors, null);
   const bar = remainingQuotaBar(remaining, used, f.barWidth, colors, null, f.unicode);
   const name = cyan(sanitizeDisplayText(imgModel.displayName || imgModel.id));
-  const reset = imgModel.resetTime
-    ? formatResetTime(new Date(Date.parse(imgModel.resetTime)), 'relative', wallClock(f.config.display), f.now)
+  const reset = !resetExpired && Number.isFinite(resetMs)
+    ? formatResetTime(new Date(resetMs), 'relative', wallClock(f.config.display), f.now)
     : '';
   return `${label(`${t('label.imageQuota')}:`, colors)} ${name} ${bar} ${color}${remaining}%${RESET}${reset ? dim(` (${reset})`) : ''}`;
 }

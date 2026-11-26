@@ -205,8 +205,15 @@ export interface MemoryInfo {
   usedPercent: number;
 }
 
-export function isLimitReached(data: UsageData): boolean {
-  return data.fiveHour === 100 || data.sevenDay === 100;
+function isWindowLimitActive(percent: number | null, resetAt: Date | null, now: number): boolean {
+  return percent === 100 && (resetAt == null || resetAt.getTime() > now);
+}
+
+export function isLimitReached(data: UsageData, now = Date.now()): boolean {
+  return (
+    isWindowLimitActive(data.fiveHour, data.fiveHourResetAt, now) ||
+    isWindowLimitActive(data.sevenDay, data.sevenDayResetAt, now)
+  );
 }
 
 export interface SessionTokenUsage {

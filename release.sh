@@ -30,6 +30,7 @@ build_zip() {
   for dir in dist runtime scripts skills src; do
     [ -d "$dir" ] && cp -r "$dir" release_tmp/ || true
   done
+  node scripts/stage-deps.mjs release_tmp --bundled
   rm -f agy-hud.zip
   if command -v zip >/dev/null 2>&1; then
     (cd release_tmp && zip -qr ../agy-hud.zip .)

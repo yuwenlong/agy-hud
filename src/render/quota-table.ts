@@ -1,8 +1,9 @@
 import type { AgyModelQuota, AgyQuotaProbe, AgyQuotaWindow } from '../types.ts';
 import { classifyQuotaProvider, isAgyImageModel, type AgyProviderKey } from '../agy-quota.ts';
-import { isCjkLanguage, t } from '../i18n/index.ts';
+import { t } from '../i18n/index.ts';
 import { sanitizeDisplayText } from '../utils/sanitize.ts';
 import type { Frame } from './frame.ts';
+import { textWidth, truncateTextToWidth } from './ansi.ts';
 import { cyan, dim, getQuotaColor, label as labelColor, remainingQuotaBar, RESET, truncateTwoDecimals, warning } from './colors.ts';
 import { formatResetTime, wallClock } from './time.ts';
 
@@ -79,9 +80,11 @@ const TABLE_BUCKET_KEYS: Record<AgyProviderKey, 'Google' | 'Claude' | 'Argon'> =
 };
 
 function truncateAndPad(str: string, width: number, unicode: boolean): string {
+  if (width <= 0) return '';
   const ellipsis = unicode ? '…' : '...';
-  if (str.length > width) return str.slice(0, Math.max(0, width - ellipsis.length)) + ellipsis;
-  return str.padEnd(width, ' ');
+  const truncated = truncateTextToWidth(str, width, ellipsis);
+  const pad = Math.max(0, width - textWidth(truncated));
+  return `${truncated}${' '.repeat(pad)}`;
 }
 
 function formatShortReset(f: Frame, resetTime: string | null | undefined): string {
@@ -93,22 +96,37 @@ function formatShortReset(f: Frame, resetTime: string | null | undefined): strin
 }
 
 function ruleBar(f: Frame, targetChars: number): string {
-  const charWidth = f.unicode && isCjkLanguage() ? 2 : 1;
-  const maxChars = f.width !== null ? Math.max(12, Math.floor((f.width - 2) / charWidth)) : targetChars;
+  const maxChars = f.width !== null ? Math.max(12, f.width - 2) : targetChars;
   const count = Math.min(targetChars, maxChars);
   return dim((f.unicode ? '─' : '-').repeat(count));
 }
 
-function renderQuotaItem(f: Frame, name: string, remainingFraction: number, resetTime: string | null | undefined, nameWidth: number): string {
+interface QuotaItemOptions {
+  barWidth?: number;
+  padTime?: boolean;
+}
+
+function renderQuotaItem(
+  f: Frame,
+  name: string,
+  remainingFraction: number,
+  resetTime: string | null | undefined,
+  nameWidth: number,
+  options: QuotaItemOptions = {},
+): string {
+  const { barWidth = 6, padTime = true } = options;
   const colors = f.config.colors;
   const remainingPct = formatQuotaPctNum(remainingFraction);
   const usedPct = 100 - remainingPct;
   const color = getQuotaColor(usedPct, colors, null);
   const namePart = cyan(truncateAndPad(sanitizeDisplayText(name), nameWidth, f.unicode));
-  const bar = remainingQuotaBar(remainingPct, usedPct, 6, colors, null, f.unicode);
+  const bar = remainingQuotaBar(remainingPct, usedPct, barWidth, colors, null, f.unicode);
   const pctStr = `${remainingPct.toFixed(2)}%`.padStart(7, ' ');
-  const timeStr = formatShortReset(f, resetTime).padEnd(6, ' ');
-  return `${namePart} ${bar} ${color}${pctStr}${RESET} ${dim(timeStr)}`;
+  const rawTime = formatShortReset(f, resetTime);
+  const timeStr = padTime ? rawTime.padEnd(9, ' ') : rawTime;
+  return timeStr
+    ? `${namePart} ${bar} ${color}${pctStr}${RESET} ${dim(timeStr)}`
+    : `${namePart} ${bar} ${color}${pctStr}${RESET}`;
 }
 
 function renderProviderTable(f: Frame, probe: AgyQuotaProbe): string[] {
@@ -161,39 +179,93 @@ function renderProviderTable(f: Frame, probe: AgyQuotaProbe): string[] {
     if (isNonExpired(pq.argon?.weekly, now)) buckets.Argon.weekly = pq.argon!.weekly!;
   }
 
-  const vbar = f.unicode ? '│' : '|';
-  const item = (lbl: string, w: AgyQuotaWindow | null) =>
-    renderQuotaItem(f, lbl, w?.remainingFraction ?? 1, w?.resetTime ?? null, 11);
+  let nameWidth = 11;
+  let barWidth = 6;
+  let twoColumn = true;
+  if (f.width !== null && f.width < 77) {
+    if (f.width >= 75) {
+      barWidth = 5;
+    } else if (f.width >= 73) {
+      barWidth = 4;
+    } else if (f.width >= 71) {
+      barWidth = 3;
+    } else if (f.width >= 65) {
+      barWidth = 3;
+      nameWidth = Math.floor((f.width - 49) / 2);
+    } else {
+      twoColumn = false;
+      barWidth = f.width >= 38 ? 6 : 4;
+      nameWidth = Math.max(6, Math.min(11, f.width - barWidth - 21));
+    }
+  }
 
-  const rows = [
-    `  ${ruleBar(f, 71)}`,
-    `  ${item('Google 5h', buckets.Google.fiveHour)} ${dim(vbar)} ${item('Claude 5h', buckets.Claude.fiveHour)}`,
-    `  ${item('Google week', buckets.Google.weekly)} ${dim(vbar)} ${item('Claude week', buckets.Claude.weekly)}`,
+  const vbar = f.unicode ? '│' : '|';
+  const item = (lbl: string, w: AgyQuotaWindow | null, padTime: boolean) =>
+    renderQuotaItem(f, lbl, w?.remainingFraction ?? 1, w?.resetTime ?? null, nameWidth, { barWidth, padTime });
+
+  const pairs: Array<[string, AgyQuotaWindow | null, string, AgyQuotaWindow | null]> = [
+    ['Google 5h', buckets.Google.fiveHour, 'Claude 5h', buckets.Claude.fiveHour],
+    ['Google week', buckets.Google.weekly, 'Claude week', buckets.Claude.weekly],
   ];
 
-  if (buckets.Argon.fiveHour || buckets.Argon.weekly) {
-    if (buckets.Argon.fiveHour && buckets.Argon.weekly) {
-      rows.push(`  ${item('Argon 5h', buckets.Argon.fiveHour)} ${dim(vbar)} ${item('Argon week', buckets.Argon.weekly)}`);
-    } else {
-      rows.push(`  ${item('Argon week', buckets.Argon.weekly ?? buckets.Argon.fiveHour)}`);
+  const rows: string[] = [`  ${ruleBar(f, twoColumn ? 77 : nameWidth + barWidth + 19)}`];
+  if (twoColumn) {
+    for (const [lLabel, lWin, rLabel, rWin] of pairs) {
+      rows.push(`  ${item(lLabel, lWin, true)} ${dim(vbar)} ${item(rLabel, rWin, false)}`);
+    }
+    if (buckets.Argon.fiveHour || buckets.Argon.weekly) {
+      if (buckets.Argon.fiveHour && buckets.Argon.weekly) {
+        rows.push(`  ${item('Argon 5h', buckets.Argon.fiveHour, true)} ${dim(vbar)} ${item('Argon week', buckets.Argon.weekly, false)}`);
+      } else if (buckets.Argon.fiveHour) {
+        rows.push(`  ${item('Argon 5h', buckets.Argon.fiveHour, false)}`);
+      } else {
+        rows.push(`  ${item('Argon week', buckets.Argon.weekly, false)}`);
+      }
+    }
+  } else {
+    const singleItems: Array<[string, AgyQuotaWindow | null]> = [
+      ['Google 5h', buckets.Google.fiveHour],
+      ['Google week', buckets.Google.weekly],
+      ['Claude 5h', buckets.Claude.fiveHour],
+      ['Claude week', buckets.Claude.weekly],
+    ];
+    if (buckets.Argon.fiveHour) singleItems.push(['Argon 5h', buckets.Argon.fiveHour]);
+    if (buckets.Argon.weekly) singleItems.push(['Argon week', buckets.Argon.weekly]);
+    for (const [lbl, w] of singleItems) {
+      rows.push(`  ${item(lbl, w, false)}`);
     }
   }
   return rows;
 }
 
 function renderModelsTable(f: Frame, probe: AgyQuotaProbe): string[] {
-  const columnWidth = f.config.display?.columnWidth ?? 40;
-  const nameWidth = Math.max(10, columnWidth - 21);
   const models = probe.models.filter((q) => !isImageModel(q));
-  const cols = models.map((q) => {
+  if (models.length === 0) return [];
+  const columnWidth = f.config.display?.columnWidth ?? 40;
+  const twoColumn = models.length > 1 && (f.width === null || f.width >= 71);
+  let nameWidth = Math.max(8, columnWidth - 24);
+  if (f.width !== null) {
+    const maxNameWidth = twoColumn ? Math.floor((f.width - 55) / 2) : f.width - 27;
+    nameWidth = Math.max(8, Math.min(nameWidth, maxNameWidth));
+  }
+  const renderModel = (q: AgyModelQuota, padTime: boolean) => {
     const crit = pickCriticalWindow(q, f.now);
-    return renderQuotaItem(f, simplifyModelName(q.displayName || q.id), crit.remainingFraction, crit.resetTime, nameWidth);
-  });
+    return renderQuotaItem(f, simplifyModelName(q.displayName || q.id), crit.remainingFraction, crit.resetTime, nameWidth, { padTime });
+  };
   const vbar = f.unicode ? '│' : '|';
-  const rule = ruleBar(f, columnWidth * 2 + 1);
+  const targetRuleWidth = twoColumn ? 2 * nameWidth + 53 : nameWidth + 25;
+  const rule = ruleBar(f, targetRuleWidth);
   const rows: string[] = [`  ${rule}`];
-  for (let i = 0; i < cols.length; i += 2) {
-    rows.push(cols[i + 1] ? `  ${cols[i]} ${dim(vbar)} ${cols[i + 1]}` : `  ${cols[i]}`);
+  if (twoColumn) {
+    for (let i = 0; i < models.length; i += 2) {
+      const hasRight = Boolean(models[i + 1]);
+      const left = renderModel(models[i], hasRight);
+      rows.push(hasRight ? `  ${left} ${dim(vbar)} ${renderModel(models[i + 1], false)}` : `  ${left}`);
+    }
+  } else {
+    for (const q of models) {
+      rows.push(`  ${renderModel(q, false)}`);
+    }
   }
   rows.push(`  ${rule}`);
   return rows;

@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAntigravityPath, getAntigravityRoots } from './paths.mjs';
-import { buildShShimContents, getWindowsAgyBinDirs, isOurShShimContents } from '../install.mjs';
+import { getWindowsAgyBinDirs, isOurShShimContents } from '../install.mjs';
+import { updateShellIntegration } from './shell.mjs';
 
 export function isOurStatusLineCommand(command, runtimeDir) {
   if (!command) return false;
@@ -28,10 +29,14 @@ export function clearStatusLine(settingsPath, runtimeDir) {
   return { changed: true };
 }
 
-export function removeRuntimeDir(runtimeDir) {
-  if (!fs.existsSync(runtimeDir)) return { removed: false, reason: 'not_present' };
-  fs.rmSync(runtimeDir, { recursive: true, force: true });
-  return { removed: true };
+export function removeRuntimeDir(runtimeDir, { rmSync = fs.rmSync, existsSync = fs.existsSync } = {}) {
+  if (!existsSync(runtimeDir)) return { removed: false, reason: 'not_present' };
+  try {
+    rmSync(runtimeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    return { removed: true };
+  } catch (error) {
+    return { removed: false, reason: error?.code || error?.message || 'remove_failed' };
+  }
 }
 
 export function removeTokenMirrors() {
@@ -63,7 +68,15 @@ export function removeExtraFiles(root) {
     path.join(root, 'hud'),
     path.join(root, 'agy-hud'),
     path.join(root, 'agy-hud.json'),
+    path.join(root, '.agy-hud-shell.json'),
   ];
+  try {
+    for (const entry of fs.readdirSync(root)) {
+      if (entry.startsWith('agy-hud-host-')) {
+        targets.push(path.join(root, entry));
+      }
+    }
+  } catch {}
   for (const target of targets) {
     if (fs.existsSync(target)) {
       try {
@@ -78,7 +91,6 @@ export function removeExtraFiles(root) {
 export function removeWindowsShShims(platform = process.platform, env = process.env) {
   if (platform !== 'win32') return [];
   try {
-    const body = buildShShimContents();
     const dirs = getWindowsAgyBinDirs(env);
     const removed = [];
     for (const dir of dirs) {
@@ -101,14 +113,26 @@ export function removeWindowsShShims(platform = process.platform, env = process.
 export function uninstall(options = {}) {
   const env = options.env || process.env;
   const homeDir = options.homeDir || os.homedir();
+  const platform = options.platform || process.platform;
   const roots = options.roots || getAntigravityRoots(env, homeDir);
   const settingsPath = options.settingsPath || resolveAntigravityPath('settings.json', env, homeDir);
 
-  const results = { settingsPath, statusLine: null, runtimes: [], tokenMirrors: [], extraFiles: [] };
+  const results = {
+    settingsPath,
+    statusLine: null,
+    runtimes: [],
+    tokenMirrors: [],
+    extraFiles: [],
+    shellIntegrations: [],
+  };
 
   for (const root of roots) {
+    results.shellIntegrations.push({
+      root,
+      ...updateShellIntegration(root, 'uninstall', env, { homeDir, platform }),
+    });
     const runtimeDir = path.join(root, 'agy-hud-runtime');
-    const runtimeResult = removeRuntimeDir(runtimeDir);
+    const runtimeResult = removeRuntimeDir(runtimeDir, options.rmSync ? { rmSync: options.rmSync } : undefined);
     results.runtimes.push({ runtimeDir, ...runtimeResult });
     const rootSettings = path.join(root, 'settings.json');
     if (rootSettings !== settingsPath) {
@@ -120,7 +144,7 @@ export function uninstall(options = {}) {
   const activeRuntimeDir = path.join(path.dirname(settingsPath), 'agy-hud-runtime');
   results.statusLine = clearStatusLine(settingsPath, activeRuntimeDir);
   results.tokenMirrors = removeTokenMirrors();
-  results.shShims = removeWindowsShShims(process.platform, env);
+  results.shShims = removeWindowsShShims(platform, env);
 
   return results;
 }
@@ -132,6 +156,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === SELF) {
   process.stdout.write(`settings: ${result.settingsPath} (${result.statusLine.changed ? 'cleared' : result.statusLine.reason})\n`);
   for (const r of result.runtimes) {
     if (r.removed) process.stdout.write(`runtime removed: ${r.runtimeDir}\n`);
+  }
+  for (const s of result.shellIntegrations) {
+    for (const file of s.removed || []) process.stdout.write(`shell integration removed: ${file}\n`);
   }
   for (const f of result.tokenMirrors) process.stdout.write(`token mirror removed: ${f}\n`);
   for (const f of result.extraFiles) process.stdout.write(`extra file removed: ${f}\n`);

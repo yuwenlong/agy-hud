@@ -18,6 +18,14 @@ delete process.env.AGY_HUD_DISABLE;
 delete process.env.CLAUDE_HUD_DISABLE;
 delete process.env.AGY_HUD_FORCE_ASCII;
 delete process.env.AGY_HUD_FORCE_UNICODE;
+delete process.env.ZDOTDIR;
+delete process.env.AGY_HUD_SHELL;
+delete process.env.AGY_HUD_PS_PROFILE;
+delete process.env.AGY_HUD_BYPASS;
+delete process.env.AGY_HUD_SHELL_ARGS;
+delete process.env.AGY_HUD_SHELL_MANAGED;
+delete process.env.AGY_HUD_HOST_STATE;
+delete process.env.AGY_BIN;
 process.env.LANG = 'en_US.UTF-8';
 process.env.TZ = 'UTC';
 

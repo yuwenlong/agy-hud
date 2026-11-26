@@ -18,6 +18,24 @@ set -euo pipefail
 REPO_RAW="${AGY_HUD_REPO_RAW:-https://raw.githubusercontent.com/yuwenlong/agy-hud/main}"
 REPO_URL="${AGY_HUD_REPO_URL:-https://github.com/yuwenlong/agy-hud.git}"
 
+if [ -z "${AGY_HUD_SHELL:-}" ]; then
+  parent_comm=''
+  if [ -n "${PPID:-}" ] && [ -r "/proc/$PPID/comm" ]; then
+    parent_comm=$(<"/proc/$PPID/comm") || parent_comm=''
+  elif [ -n "${PPID:-}" ] && command -v ps >/dev/null 2>&1; then
+    parent_comm=$(ps -p "$PPID" -o comm= 2>/dev/null) || parent_comm=''
+  fi
+  parent_comm="${parent_comm#"${parent_comm%%[![:space:]]*}"}"
+  parent_comm="${parent_comm%"${parent_comm##*[![:space:]]}"}"
+  parent_comm="${parent_comm#-}"
+  parent_comm="${parent_comm##*/}"
+  parent_comm="${parent_comm#-}"
+  case "$parent_comm" in
+    bash|bash[-0-9.]*|rbash) export AGY_HUD_SHELL=bash ;;
+    zsh|zsh[-0-9.]*) export AGY_HUD_SHELL=zsh ;;
+  esac
+fi
+
 if ! command -v agy >/dev/null 2>&1; then
   echo "agy-hud: agy CLI not on PATH. Install it first:" >&2
   echo "  curl -fsSL https://antigravity.google/cli/install.sh | bash" >&2
@@ -67,10 +85,17 @@ else
   NODE_USE_ENV_PROXY=1 AGY_HUD_REPO_RAW="$REPO_RAW" node "$TMP_BOOTSTRAP"
 fi
 
+ACTIVATE_SCRIPT="${AGY_HUD_DATA_DIR:-$HOME/.gemini/antigravity-cli}/agy-hud-runtime/scripts/activate.sh"
+
 cat <<DONE
 
 ==> agy-hud installed.
-    Open a new agy session in your terminal to see the HUD.
+    Open a new terminal and run \`agy\` to see the live HUD.
     Run /hud doctor or \`node ~/.gemini/antigravity-cli/agy-hud-runtime/hud.mjs doctor\` to inspect diagnostics.
     Repair anytime by re-running this script.
 DONE
+
+if [ "${AGY_HUD_SHELL:-}" != "none" ] && [ -f "$ACTIVATE_SCRIPT" ]; then
+  echo "    To enable in this terminal session immediately, run:"
+  echo "      . \"$ACTIVATE_SCRIPT\""
+fi

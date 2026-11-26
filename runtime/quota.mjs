@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getAntigravityRoots } from './paths.mjs';
+import { expandHome, getAntigravityRoots } from './paths.mjs';
 import * as tokenMod from './quota/token.mjs';
 import * as cacheMod from './quota/cache.mjs';
 import * as cloudMod from './quota/cloud.mjs';
@@ -12,9 +12,37 @@ import * as modelsMod from './quota/models.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const WINDOWS_CREDENTIAL_REFRESH_DEBOUNCE_MS = 30 * 1000;
 export const BACKGROUND_REFRESH_COOLDOWN_MS = 15 * 1000;
+export const BACKGROUND_REFRESH_ATTEMPT_COOLDOWN_MS = BACKGROUND_REFRESH_COOLDOWN_MS;
+export const RESET_EXPIRY_DEBOUNCE_MS = 2 * 1000;
 let lastWindowsCredentialRefreshAt = 0;
+const refreshAttempts = new Map();
 
-const expandHome = (p, home) => (p === '~' ? home : p.startsWith('~/') || p.startsWith('~\\') ? path.join(home, p.slice(2)) : p);
+function buildRefreshAttemptKey(tok, lastRefreshed, payload) {
+  const tokHash = cacheMod.getTokenHash(tok) || '';
+  return JSON.stringify([
+    tokHash,
+    lastRefreshed,
+    payload?.expiresAt ?? null,
+    payload?.data ?? null,
+    payload?.providerQuota ?? null,
+  ]);
+}
+
+function shouldThrottleRefreshAttempt(cachePath, attemptKey, now) {
+  const scope = path.resolve(cachePath || 'default');
+  const prev = refreshAttempts.get(scope);
+  if (!prev || prev.fingerprint !== attemptKey) return false;
+  return now >= prev.at && now - prev.at < BACKGROUND_REFRESH_ATTEMPT_COOLDOWN_MS;
+}
+
+function recordRefreshAttempt(cachePath, attemptKey, now) {
+  const scope = path.resolve(cachePath || 'default');
+  if (refreshAttempts.size >= 64 && !refreshAttempts.has(scope)) {
+    const oldest = refreshAttempts.keys().next().value;
+    if (oldest !== undefined) refreshAttempts.delete(oldest);
+  }
+  refreshAttempts.set(scope, { at: now, fingerprint: attemptKey });
+}
 
 export function resolveQuotaRoots(
   env = process.env,
@@ -68,6 +96,39 @@ function triggerWindowsCredentialRefresh(backgroundRefresh, now, debounceMs, ref
   backgroundRefresh(refreshContext);
 }
 
+function isResetExpiredSinceLastRefresh(resetTime, lastRefreshed, now) {
+  if (!resetTime) return false;
+  const resetTs = Date.parse(resetTime);
+  return Number.isFinite(resetTs) && lastRefreshed < resetTs && resetTs <= now;
+}
+
+function hasRecentlyExpiredReset(payload, lastRefreshed, now) {
+  if (!payload || !Number.isFinite(lastRefreshed) || lastRefreshed <= 0) return false;
+  if (Array.isArray(payload.data)) {
+    for (const m of payload.data) {
+      if (
+        isResetExpiredSinceLastRefresh(m?.resetTime, lastRefreshed, now)
+        || isResetExpiredSinceLastRefresh(m?.windows?.fiveHour?.resetTime, lastRefreshed, now)
+        || isResetExpiredSinceLastRefresh(m?.windows?.weekly?.resetTime, lastRefreshed, now)
+      ) {
+        return true;
+      }
+    }
+  }
+  const pq = payload.providerQuota || payload.data?.providerQuota;
+  if (pq && typeof pq === 'object') {
+    for (const group of Object.values(pq)) {
+      if (
+        isResetExpiredSinceLastRefresh(group?.fiveHour?.resetTime, lastRefreshed, now)
+        || isResetExpiredSinceLastRefresh(group?.weekly?.resetTime, lastRefreshed, now)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export async function getQuota(options = {}) {
   const {
     fast = false,
@@ -78,13 +139,14 @@ export async function getQuota(options = {}) {
     roots = resolveQuotaRoots(),
     windowsCredentialRefreshDebounceMs = WINDOWS_CREDENTIAL_REFRESH_DEBOUNCE_MS,
     cachePath = resolveQuotaCachePath(),
+    now = Date.now(),
   } = options;
 
   const refreshContext = { cachePath, roots };
   const shouldRefreshWindowsCredential = fast && platform === 'win32';
   const refreshWindowsCredential = () => {
     if (!shouldRefreshWindowsCredential) return;
-    triggerWindowsCredentialRefresh(backgroundRefresh, Date.now(), windowsCredentialRefreshDebounceMs, refreshContext);
+    triggerWindowsCredentialRefresh(backgroundRefresh, now, windowsCredentialRefreshDebounceMs, refreshContext);
   };
 
   const tok = tokenReader({
@@ -93,12 +155,13 @@ export async function getQuota(options = {}) {
     credentialReader,
     skipWindowsCredential: fast && platform === 'win32',
     skipKeychain: fast,
+    now,
   });
 
   if (!tok) {
     if (tokenMod.anyTokenFileExists(roots)) {
       const fallback = cacheMod.readCacheFallback(cachePath);
-      if (fallback && cacheMod.isCachePayloadFresh(fallback)) return fallback.data;
+      if (fallback && cacheMod.isCachePayloadFresh(fallback, now) && now < fallback.expiresAt) return fallback.data;
     }
     refreshWindowsCredential();
     return modelsMod.createUnavailableQuotaResult('not_logged_in');
@@ -106,14 +169,23 @@ export async function getQuota(options = {}) {
 
   const payload = cacheMod.readCachePayload(tok, cachePath)
     || (tok.all && tok.all.slice(1).reduce((acc, t) => acc || cacheMod.readCachePayload(t, cachePath), null));
-  const isFresh = payload && cacheMod.isCachePayloadFresh(payload);
-  const tokenExpired = tokenMod.isTokenExpired(tok);
-  const needsRefresh = !tokenExpired && (!isFresh || cacheMod.didAccessTokenRotate(payload, tok));
+  const isFresh = payload && cacheMod.isCachePayloadFresh(payload, now) && now < payload.expiresAt;
+  const tokenExpired = tokenMod.isTokenExpired(tok, now);
+  const tokenRotated = cacheMod.didAccessTokenRotate(payload, tok);
+  const needsRefresh = !tokenExpired && (!isFresh || tokenRotated);
 
   if (needsRefresh) {
     const lastRefreshed = payload ? (payload.lastRefreshed || 0) : cacheMod.readCacheLastRefreshed(cachePath);
-    if (cacheMod.didAccessTokenRotate(payload, tok) || Date.now() - lastRefreshed > BACKGROUND_REFRESH_COOLDOWN_MS) {
-      backgroundRefresh(refreshContext);
+    const elapsedSinceRefresh = now - lastRefreshed;
+    const resetRecentlyExpired = !tokenRotated
+      && elapsedSinceRefresh >= RESET_EXPIRY_DEBOUNCE_MS
+      && hasRecentlyExpiredReset(payload, lastRefreshed, now);
+    if (tokenRotated || elapsedSinceRefresh > BACKGROUND_REFRESH_COOLDOWN_MS || resetRecentlyExpired) {
+      const attemptKey = buildRefreshAttemptKey(tok, lastRefreshed, payload);
+      if (!shouldThrottleRefreshAttempt(cachePath, attemptKey, now)) {
+        recordRefreshAttempt(cachePath, attemptKey, now);
+        backgroundRefresh(refreshContext);
+      }
     }
   }
 

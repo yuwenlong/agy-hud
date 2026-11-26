@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolveSpawnCommand } from '../runtime/launch.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..');
-const zipPath = path.join(projectRoot, 'agy-hud.zip');
 const agyBin = process.env.AGY_BIN || 'agy';
 const currentHome = process.argv.includes('--current-home');
 const timeoutArg = process.argv.find((arg) => arg.startsWith('--observe-timeout-ms='));
@@ -125,13 +124,45 @@ function fail(message, details) {
   process.exit(1);
 }
 
+export function resolveNoAuthStatusLineSpawn(
+  cmd,
+  env = process.env,
+  platform = process.platform,
+  execPath = process.execPath,
+) {
+  if (platform === 'win32') {
+    const normalized = /^"([^"]+)"$/.test(cmd) ? cmd.slice(1, -1) : cmd;
+    const target = resolveSpawnCommand(normalized, [], { env, platform, execPath });
+    const options = { shell: false };
+    if (target.windowsVerbatimArguments) {
+      options.windowsVerbatimArguments = true;
+      if (/[\s\t]/.test(target.file) && !target.file.startsWith('"')) {
+        options.argv0 = `"${target.file}"`;
+      }
+    }
+    return { file: target.file, args: target.args, options };
+  }
+  return {
+    file: '/bin/sh',
+    args: ['-c', cmd],
+    options: { shell: false },
+  };
+}
+
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, {
+    const spawnOptions = {
       cwd: options.cwd || projectRoot,
       env: options.env || process.env,
       shell: options.shell || false,
-    });
+    };
+    if (options.windowsVerbatimArguments) {
+      spawnOptions.windowsVerbatimArguments = true;
+    }
+    if (options.argv0) {
+      spawnOptions.argv0 = options.argv0;
+    }
+    const child = spawn(command, args, spawnOptions);
     if (options.stdin !== undefined) {
       child.stdin.end(options.stdin);
     }
@@ -152,31 +183,6 @@ function run(command, args, options = {}) {
     child.on('error', (error) => {
       clearTimeout(timer);
       resolve({ status: null, signal: null, stdout, stderr, timedOut, error });
-    });
-  });
-}
-
-function startZipServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url !== '/agy-hud.zip') {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-    const stat = fs.statSync(zipPath);
-    res.writeHead(200, {
-      'Content-Type': 'application/zip',
-      'Content-Length': stat.size,
-    });
-    fs.createReadStream(zipPath).pipe(res);
-  });
-
-  return new Promise((resolve) => {
-    server.listen(0, () => {
-      resolve({
-        server,
-        url: `http://localhost:${server.address().port}/agy-hud.zip`,
-      });
     });
   });
 }
@@ -351,7 +357,6 @@ async function main() {
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-hud-verify-'));
   const env = buildEnv(tmpRoot);
-  const { server } = await startZipServer();
   try {
     const install = await run(agyBin, ['plugin', 'install', projectRoot], { env, timeout: 120_000 });
     const stagedPluginDir = getPluginDirs(env).find((pluginDir) => fs.existsSync(pluginDir));
@@ -394,14 +399,16 @@ async function main() {
       if (!cmd) {
         observation = { stdout: '', stderr: 'no statusLine.command in settings.json', mode: 'no-auth-direct', status: 1 };
       } else {
-        const emptyRes = await run(cmd, [], { env, stdin: '\n', shell: true, timeout: 10_000 });
+        const target = resolveNoAuthStatusLineSpawn(cmd, env, process.platform);
+        const runOpts = { ...target.options, env, timeout: 10_000 };
+        const emptyRes = await run(target.file, target.args, { ...runOpts, stdin: '\n' });
         const sample = JSON.stringify({
           model: { id: 'gemini-3-pro', display_name: 'Gemini 3 Pro (High)' },
           cwd: projectRoot,
           context_window: { context_window_size: 200_000, used_percentage: 42 },
           rate_limits: { five_hour: { used_percentage: 20, resets_at: Math.floor(Date.now() / 1000) + 7200 } },
         });
-        const direct = await run(cmd, [], { env, stdin: `${sample}\n`, shell: true, timeout: 10_000 });
+        const direct = await run(target.file, target.args, { ...runOpts, stdin: `${sample}\n` });
         observation = {
           stdout: direct.stdout,
           stderr: direct.stderr,
@@ -460,7 +467,6 @@ async function main() {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     if (!displayReady) process.exit(1);
   } finally {
-    server.close();
     if (!currentHome) fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 }

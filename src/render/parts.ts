@@ -194,7 +194,7 @@ export function modePart(f: Frame): string | null {
   if (!modeStr) return null;
   const lower = modeStr.toLowerCase();
   if (lower.includes('accept') || lower.includes('always') || lower.includes('bypass')) return yellow(modeStr);
-  return lower === 'plan' ? cyan(modeStr) : cyan(modeStr);
+  return cyan(modeStr);
 }
 
 export function tierPart(f: Frame): string | null {

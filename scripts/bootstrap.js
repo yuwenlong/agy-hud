@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -21,13 +22,18 @@ export const RUNTIME_FILES = [
   'collector.mjs',
   'fence.mjs',
   'install.mjs',
+  'scripts/activate.sh',
   'scripts/statusline.mjs',
   'runtime/bin/agy-hud.js',
   'runtime/bin/agy-hud.cmd',
   'runtime/config-wizard.mjs',
   'runtime/encoding.mjs',
+  'runtime/launch.mjs',
   'runtime/paths.mjs',
+  'runtime/pty-deps.mjs',
+  'runtime/pty-host.mjs',
   'runtime/quota.mjs',
+  'runtime/shell.mjs',
   'runtime/uninstall.mjs',
   'runtime/update-checker.mjs',
   'runtime/quota/cache.mjs',
@@ -306,6 +312,186 @@ export async function refreshQuotaCache(runtimeDir, options = {}) {
   }
 }
 
+function quoteWin32BatchCommand(filePath) {
+  const str = String(filePath);
+  if (/[\r\n\0]/.test(str)) {
+    throw new Error('Windows batch commands cannot contain CR, LF, or NUL characters.');
+  }
+  if (str.includes('"')) {
+    throw new Error('Windows batch commands cannot contain double quote characters.');
+  }
+  if (!str.includes('%')) {
+    return `"${str}"`;
+  }
+  // cmd.exe processes `^` escapes only outside quotes, so command paths with `%`
+  // stay unquoted with single-layer `^` escaping to avoid literal `"` in argv[0].
+  return str.replace(/[\s"&|<>()^;%!`,=]/g, '^$&');
+}
+
+function quoteWin32BatchArg(value) {
+  const str = String(value);
+  if (/[\r\n\0]/.test(str)) {
+    throw new Error('Windows batch arguments cannot contain CR, LF, or NUL characters.');
+  }
+  if (str.length > 0 && !/[\s"&|<>()^;%!`,=]/.test(str)) {
+    return str;
+  }
+  if (!str.includes('"') && !str.includes('%')) {
+    return `"${str.replace(/(\\+)$/, '$1$1')}"`;
+  }
+  const msvc = `"${str.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`;
+  return msvc.replace(/(\^)|([ \t"&|<>();,=!])|(%)/g, (_, caret, meta, pct) => {
+    if (caret) return '^^^^';
+    if (meta) return `^^^${meta}`;
+    return '^%';
+  });
+}
+
+function findWin32OnPath(name, env = process.env, existsSync = fs.existsSync) {
+  const pathKey = Object.keys(env ?? {}).find((k) => k.toLowerCase() === 'path');
+  const pathEntries = (pathKey ? env[pathKey] : '')?.split(';') ?? [];
+  for (const rawEntry of pathEntries) {
+    const dir = rawEntry.trim().replace(/^"(.*)"$/, '$1');
+    if (!dir || dir === '.' || !path.win32.isAbsolute(dir)) continue;
+    const candidate = path.win32.join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+export function buildNpmDepsSpawn(
+  targetDir,
+  env = process.env,
+  { platform = process.platform, execPath = process.execPath, existsSync = fs.existsSync } = {},
+) {
+  const npmArgs = [
+    'install',
+    '--omit=dev',
+    '--ignore-scripts',
+    '--no-audit',
+    '--no-fund',
+    '--no-save',
+    '--prefix',
+    targetDir,
+    '@xterm/headless@^6.0.0',
+    'node-pty@1.2.0-beta.18',
+  ];
+  const baseOptions = {
+    env,
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  };
+  if (platform !== 'win32') {
+    return { cmd: 'npm', args: npmArgs, options: baseOptions };
+  }
+
+  const npmCmdOnPath = findWin32OnPath('npm.cmd', env, existsSync);
+  const cliCandidates = [
+    execPath && path.win32.isAbsolute(execPath)
+      ? path.win32.join(path.win32.dirname(execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+      : null,
+    npmCmdOnPath
+      ? path.win32.join(path.win32.dirname(npmCmdOnPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+      : null,
+    env?.APPDATA
+      ? path.win32.join(env.APPDATA, 'npm', 'node_modules', 'npm', 'bin', 'npm-cli.js')
+      : null,
+  ].filter(Boolean);
+
+  for (const cliPath of cliCandidates) {
+    if (existsSync(cliPath)) {
+      return { cmd: execPath, args: [cliPath, ...npmArgs], options: baseOptions };
+    }
+  }
+
+  const cmd = env?.ComSpec || env?.COMSPEC || 'cmd.exe';
+  const npmExecutable = npmCmdOnPath || 'npm.cmd';
+  const inner = [
+    quoteWin32BatchCommand(npmExecutable),
+    ...npmArgs.map((arg) => quoteWin32BatchArg(arg)),
+  ].join(' ');
+  const spawnOptions = {
+    ...baseOptions,
+    windowsVerbatimArguments: true,
+  };
+  if (/[\s\t]/.test(cmd) && !cmd.startsWith('"')) {
+    spawnOptions.argv0 = `"${cmd}"`;
+  }
+  return {
+    cmd,
+    args: ['/d', '/s', '/c', `"${inner}"`],
+    options: spawnOptions,
+  };
+}
+
+function runNpmDepsInstall(targetDir, env, platform = process.platform) {
+  const { cmd, args, options } = buildNpmDepsSpawn(targetDir, env, { platform });
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, options);
+    child.stdout?.resume?.();
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGTERM');
+      reject(new Error('npm install timed out after 120s'));
+    }, 120_000);
+    child.stderr?.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-4096);
+    });
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`npm install exited with code ${code}${stderr ? `: ${stderr.trim()}` : ''}`));
+    });
+  });
+}
+
+async function deployRuntimeDependencies(tempRuntimeDir, { sourceDir, sourceBase, env, options }) {
+  const platform = options.platform || process.platform;
+  const arch = options.arch || process.arch;
+  const hasCustomInstaller = typeof options.depsInstaller === 'function';
+
+  if (options.installDeps === false && !hasCustomInstaller) {
+    return { status: 'skipped', reason: 'disabled' };
+  }
+
+  const ptyDepsUrl = `${pathToFileURL(path.join(tempRuntimeDir, 'runtime', 'pty-deps.mjs')).href}?t=${Date.now()}`;
+  const { hasHostDependencies, stageDependencies } = await import(ptyDepsUrl);
+
+  if (sourceDir && hasHostDependencies(sourceDir, platform, arch)) {
+    const staged = stageDependencies(sourceDir, tempRuntimeDir, { hostOnly: true, platform, arch });
+    return { status: 'staged', source: 'local', count: staged.files.length };
+  }
+
+  const isLocalHttpMock = typeof sourceBase === 'string' && sourceBase.startsWith('http://127.0.0.1');
+  if (!hasCustomInstaller && isLocalHttpMock) {
+    return { status: 'skipped', reason: 'local_test_server' };
+  }
+
+  try {
+    if (hasCustomInstaller) {
+      await options.depsInstaller(tempRuntimeDir);
+      return { status: 'installed', source: 'custom' };
+    }
+    await runNpmDepsInstall(tempRuntimeDir, env, platform);
+    return { status: 'installed', source: 'npm' };
+  } catch (error) {
+    process.stderr.write(`[agy-hud] warning: terminal dependencies unavailable (${error.message}); continuing in statusLine mode\n`);
+    return { status: 'failed', reason: error.message };
+  }
+}
+
 export async function installRuntime(options = {}) {
   const env = options.env || process.env;
   const homeDir = options.homeDir || os.homedir();
@@ -330,6 +516,7 @@ export async function installRuntime(options = {}) {
     }
   }
 
+  let depsStatus = { status: 'skipped', reason: 'not_started' };
   try {
     await mapConcurrent(RUNTIME_FILES, sourceDir ? 16 : 3, async (relativePath) => {
       const body = await readRuntimeFile(relativePath, {
@@ -342,6 +529,7 @@ export async function installRuntime(options = {}) {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, body);
     });
+    depsStatus = await deployRuntimeDependencies(tempRuntimeDir, { sourceDir, sourceBase, env, options });
     fs.mkdirSync(path.dirname(runtimeDir), { recursive: true });
     replaceRuntimeDirAtomically(runtimeDir, tempRuntimeDir);
   } catch (error) {
@@ -361,6 +549,18 @@ export async function installRuntime(options = {}) {
     writeCmdShim(path.join(runtimeDir, 'runtime', 'bin', 'agy-hud.js'), options.platform || process.platform);
   }
 
+  let shellIntegration = { status: 'skipped', reason: 'AGY_HUD_SHELL=none' };
+  if (env.AGY_HUD_SHELL !== 'none') {
+    const shellUrl = `${pathToFileURL(path.join(runtimeDir, 'runtime', 'shell.mjs')).href}?t=${Date.now()}`;
+    const { updateShellIntegration } = await import(shellUrl);
+    shellIntegration = updateShellIntegration(
+      antigravityRoot,
+      'install',
+      { ...env, HOME: homeDir, USERPROFILE: homeDir },
+      { homeDir, platform: options.platform },
+    );
+  }
+
   const quotaRefresh = await refreshQuotaCache(runtimeDir, {
     env,
     homeDir,
@@ -376,6 +576,8 @@ export async function installRuntime(options = {}) {
     files: RUNTIME_FILES,
     stalePluginFiles,
     quotaRefresh,
+    shellIntegration,
+    depsStatus,
   };
 }
 
@@ -392,6 +594,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       process.stdout.write(`runtime: ${result.runtimeDir}\n`);
       process.stdout.write(`settings: ${result.settingsPath}\n`);
       process.stdout.write(`statusLine: ${result.command}\n`);
+      process.stdout.write(`deps: ${result.depsStatus.status}${result.depsStatus.source ? ` (${result.depsStatus.source})` : ''}${result.depsStatus.reason ? ` (${result.depsStatus.reason})` : ''}\n`);
+      if (result.shellIntegration?.configured?.length) {
+        process.stdout.write(`shell: ${result.shellIntegration.shell} (${result.shellIntegration.configured.map((c) => c.path).join(', ')})\n`);
+      } else {
+        process.stdout.write(`shell: ${result.shellIntegration?.reason || 'none'}\n`);
+      }
       if (result.stalePluginFiles.length > 0) {
         process.stdout.write(`cleaned ${result.stalePluginFiles.length} stale plugin file(s) from prior install\n`);
       }

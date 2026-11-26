@@ -163,11 +163,11 @@ export function writeWindowsTokenTemp(tokens, roots = getAntigravityRoots()) {
   } catch {}
 }
 
-export function readWindowsTokenTemp(roots = getAntigravityRoots()) {
+export function readWindowsTokenTemp(roots = getAntigravityRoots(), now = Date.now()) {
   try {
     const tmp = resolveTokenTempPath(roots);
     const raw = JSON.parse(fs.readFileSync(tmp, 'utf8'));
-    return tokenResultFromTokens(selectUsableTokens(raw.tokens, raw.writtenAt));
+    return tokenResultFromTokens(selectUsableTokens(raw.tokens, raw.writtenAt, now));
   } catch {
     return null;
   }
@@ -356,6 +356,7 @@ export function readToken(options = {}) {
     credentialReader = readWindowsCredentialTokens,
     keyringReader = readLinuxKeyringTokens,
     keychainReader = readMacosKeychainTokens,
+    now = Date.now(),
   } = options;
 
   if (platform === 'darwin' && !skipKeychain) {
@@ -368,7 +369,7 @@ export function readToken(options = {}) {
       const credentialToken = credentialReader(platform, roots);
       if (credentialToken) return credentialToken;
     }
-    const tempToken = readWindowsTokenTemp(roots);
+    const tempToken = readWindowsTokenTemp(roots, now);
     if (tempToken) return { ...tempToken, sourceFormat: tempToken.sourceFormat || 'windows-credential' };
   }
 
@@ -377,7 +378,7 @@ export function readToken(options = {}) {
       const keyringToken = normalizeKeyringTokenResult(keyringReader(platform, roots));
       if (keyringToken) return keyringToken;
     }
-    const tempToken = readWindowsTokenTemp(roots);
+    const tempToken = readWindowsTokenTemp(roots, now);
     if (tempToken) return { ...tempToken, sourceFormat: tempToken.sourceFormat || 'linux-keyring' };
   }
 
